@@ -117,9 +117,13 @@ jobs:
         run: |
           $exe = "src-tauri/target/release/routa.exe"
           if (!(Test-Path $exe)) { throw "Missing application: $exe" }
-          $raw = & $exe --build-info
-          if ($LASTEXITCODE -ne 0) { throw "routa.exe --build-info failed with exit code $LASTEXITCODE" }
-          $info = $raw | ConvertFrom-Json
+          # A Windows subsystem executable must be explicitly waited for;
+          # PowerShell's direct invocation can close its output pipe early.
+          $out = Join-Path $env:RUNNER_TEMP 'routa-build-info.json'
+          $err = Join-Path $env:RUNNER_TEMP 'routa-build-info.stderr'
+          $child = Start-Process -FilePath (Resolve-Path $exe).Path -ArgumentList '--build-info' -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru
+          if ($child.ExitCode -ne 0) { throw "routa.exe --build-info failed with exit code $($child.ExitCode): $(Get-Content -Raw $err)" }
+          $info = Get-Content -Raw $out | ConvertFrom-Json
           $expected = $env:ROUTA_PREVIEW_PR -eq 'true'
           if ($info.format -ne 'ROUTA_BUILD_INFO_V1' -or $info.preview -isnot [bool] -or $info.preview -ne $expected) {
             throw "Unexpected application build identity (expected isolated preview=$expected)"
