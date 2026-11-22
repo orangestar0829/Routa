@@ -225,11 +225,16 @@ try {
   await text("新增共享规则");
   await fill("匹配内容", "windows-smoke.example");
   await click("[role=dialog] button", "保存");
+  await click("button", "中国大陆直连");
   await click("button", "保存并应用");
   await wait("shared rules apply finished", () => evaluate(`Array.from(document.querySelectorAll("button")).some(
     (el) => el.innerText.trim() === "保存并应用" && el.disabled && el.querySelector("[role=progressbar]") === null
   )`));
   await text("windows-smoke.example");
+  await text("GEOSITE");
+  await text("GEOIP");
+  await evaluate(`Array.from(document.querySelectorAll('[role="alert"]'))
+    .find(el => el.textContent.includes("共享规则已保存并应用"))?.querySelector("button")?.click()`);
   await capture("02-shared-rules");
 
   report.stage = "verify port inheritance";
@@ -258,6 +263,8 @@ try {
   const baselineWidth = await evaluate("innerWidth");
   await resize(940);
   await wait("actual narrower native window", async () => await evaluate("innerWidth") < baselineWidth - 20);
+  await wait("single-line rule order header", () => evaluate(`Array.from(document.querySelectorAll("th"))
+    .some(el => el.textContent.trim() === "顺序" && getComputedStyle(el).whiteSpace === "nowrap")`));
   await capture("04-shared-rules-narrow");
   report.stage = "complete";
   report.status = "passed";

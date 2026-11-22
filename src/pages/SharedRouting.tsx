@@ -293,14 +293,14 @@ export function SharedRoutingPage() {
           </Box> : tab === "rules" ? (
             rules.length ? <Table size="small" stickyHeader aria-label="共享规则列表">
               <TableHead><TableRow>
-                <TableCell sx={{ width: 48 }}>顺序</TableCell><TableCell>匹配条件</TableCell>
+                <TableCell sx={{ width: 56, px: 1.5, whiteSpace: "nowrap" }}>顺序</TableCell><TableCell>匹配条件</TableCell>
                 <TableCell sx={{ width: 72 }}>去向</TableCell><TableCell sx={{ width: 56 }}>启用</TableCell>
                 <TableCell align="right" sx={{ width: 148 }}>操作</TableCell>
               </TableRow></TableHead>
               <TableBody>{rules.map(({ rule, id }, index) => {
                 const label = `第 ${index + 1} 条规则`;
                 return <TableRow key={id} hover>
-                  <TableCell sx={{ color: "text.secondary" }}>{index + 1}</TableCell>
+                  <TableCell sx={{ color: "text.secondary", px: 1.5 }}>{index + 1}</TableCell>
                   <TableCell sx={{ overflowWrap: "anywhere" }}>
                     <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>{MATCH_LABELS[rule.matcher]}</Typography>
                     <Typography variant="body2" data-selectable="true">{rule.value || "—"}</Typography>
