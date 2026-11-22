@@ -35,9 +35,13 @@ fn rule_provider_yaml(provider: &SharedRuleProvider) -> Value {
         RuleProviderFormat::Mrs => "mrs",
     };
     // Leave the path to mihomo: it uses a URL-derived cache path in its home.
+    // Fetch an explicitly configured provider directly. Without this override
+    // the core's internal HTTP request hits the global fail-closed MATCH,REJECT
+    // and silently leaves a new provider empty. Listener routing is unchanged.
     map(vec![
         ("type", s("http")),
         ("url", s(&provider.url)),
+        ("proxy", s("DIRECT")),
         ("behavior", s(behavior)),
         ("format", s(format)),
         ("interval", Value::from(provider.interval)),
@@ -879,6 +883,8 @@ mod tests {
         let nic = nics().into_iter().find(|nic| nic.guid.0 == "{G1}").unwrap();
         assert_eq!(find(&cfg, "proxies", "__direct_la").unwrap()["interface-name"], nic.mihomo_name.as_str());
         assert_eq!(cfg["rule-providers"]["domains"]["type"], "http");
+        assert_eq!(cfg["rule-providers"]["domains"]["proxy"], "DIRECT");
+        assert_eq!(cfg["rules"][0], "MATCH,REJECT");
         assert_eq!(cfg["rule-providers"]["domains"]["behavior"], "domain");
         assert_eq!(cfg["rule-providers"]["domains"]["format"], "mrs");
         assert_eq!(cfg["rule-providers"]["domains"]["interval"], 86400);

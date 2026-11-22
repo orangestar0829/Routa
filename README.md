@@ -48,7 +48,7 @@ Stopping system proxy or TUN leaves the core and proxy ports available; manually
 
 ## Shared routing rules
 
-In Full mode, open **共享规则** (Shared rules) to edit, reorder, and toggle common rules or add the mainland-China direct preset. To use a remote mihomo rule set, register it first and then reference it from a `RULE-SET` rule.
+In Full mode, open **共享规则** (Shared rules) to edit, reorder, and toggle common rules or add the mainland-China direct preset. To use a remote mihomo rule set, register it first and then reference it from a `RULE-SET` rule. Routa fetches these sources directly, independently of proxy ports; prefer trusted HTTPS sources.
 
 Opt in separately for each listener in **代理** (Proxies). Routa checks **per-port rules → enabled shared rules → the port's existing fallback**, in that order. A Proxy action still uses the listener's own outbound. Existing listeners do not opt in automatically. Process-routing settings do not need to change.
 

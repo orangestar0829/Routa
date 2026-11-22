@@ -137,7 +137,7 @@ function ProviderEditor({ existing, providers, onSave, onClose }: {
           error={!!errs.name} helperText={errs.name} placeholder="my-rules"
           onChange={(e) => { setProvider({ ...provider, name: e.target.value }); setErrs({ ...errs, name: undefined }); }} />
         <TextField label="远程地址" value={provider.url} placeholder="https://example.com/rules.yaml"
-          error={!!errs.url} helperText={errs.url ?? (/^http:\/\//i.test(provider.url) ? "HTTP 未加密，建议使用 HTTPS" : undefined)}
+          error={!!errs.url} helperText={errs.url ?? (/^http:\/\//i.test(provider.url) ? "来源走直连；HTTP 未加密，建议使用 HTTPS" : "更新规则集时直连来源，不走代理端口")}
           onChange={(e) => { setProvider({ ...provider, url: e.target.value }); setErrs({ ...errs, url: undefined }); }} />
         <TextField select label="规则类型" value={provider.behavior}
           onChange={(e) => setProvider({ ...provider, behavior: e.target.value as SharedRuleProvider["behavior"] })}>

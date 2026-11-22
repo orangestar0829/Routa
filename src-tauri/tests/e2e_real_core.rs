@@ -66,6 +66,33 @@ fn spawn_rule_provider() -> u16 {
     port
 }
 
+async fn wait_for_one_rule(ctrl: u16, secret: &str, name: &str) {
+    let http = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();
+    let url = format!("http://127.0.0.1:{ctrl}/providers/rules");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match http.get(&url).bearer_auth(secret).send().await {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        let count = data["providers"][name]["ruleCount"].as_u64();
+                        if count == Some(1) {
+                            return;
+                        }
+                        last = format!("{name} ruleCount={count:?}");
+                    }
+                    Err(error) => last = error.to_string(),
+                },
+                Err(error) => last = error.to_string(),
+            },
+            Err(error) => last = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("real HTTP rule provider did not initialize: {last}");
+}
+
 fn curl_status(proxy_port: u16, url: &str) -> String {
     let out = Command::new("curl.exe")
         .args(["-s", "-o", "NUL", "-w", "%{http_code}", "-m", "15", "-x"])
@@ -157,7 +184,10 @@ async fn real_core_two_listeners_direct_exit() {
     // Capture the per-run secret so the test can talk to /connections itself.
     let api_slot: Arc<Mutex<Option<Arc<HttpMihomoApi>>>> = Arc::new(Mutex::new(None));
     let slot = api_slot.clone();
+    let secret_slot = Arc::new(Mutex::new(String::new()));
+    let shared_secret = secret_slot.clone();
     let api_for: ApiFor = Box::new(move |port, secret| {
+        *secret_slot.lock().unwrap() = secret.clone();
         let api = Arc::new(HttpMihomoApi::new(port, secret));
         *slot.lock().unwrap() = Some(api.clone());
         api as Arc<dyn MihomoApi>
@@ -279,6 +309,8 @@ async fn real_core_two_listeners_direct_exit() {
     .expect("apply remote ruleset");
     assert!(rt.status().failed_listeners.is_empty(), "{:?}", rt.status().failed_listeners);
     assert!(!refuses(p1), "ruleset listener must stay open");
+    let secret = shared_secret.lock().unwrap().clone();
+    wait_for_one_rule(ctrl, &secret, "loopback-fixture").await;
     let (first, second) = tokio::task::spawn_blocking(move || {
         (curl_status(p1, &url), curl_status(p2, &url))
     })
