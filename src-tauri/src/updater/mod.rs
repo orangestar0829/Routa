@@ -12,7 +12,8 @@ pub use service::{UpdateState, UpdateView, Updater};
 /// Only release builds installed by NSIS update themselves (the installer
 /// puts `uninstall.exe` next to `routa.exe`).
 pub fn is_nsis_install() -> bool {
-    !cfg!(debug_assertions)
+    !crate::IS_RULES_PREVIEW
+        && !cfg!(debug_assertions)
         && std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|d| d.join("uninstall.exe")))

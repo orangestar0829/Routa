@@ -27,6 +27,14 @@ async saveProxy(l: Listener, target: Exit) : Promise<Result<ApplyOutcome, Valida
     else return { status: "error", error: e  as any };
 }
 },
+async saveSharedRouting(rules: SharedRule[], providers: SharedRuleProvider[]) : Promise<Result<ApplyOutcome, ValidationError[]>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_shared_routing", { rules, providers }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async deleteListener(id: ListenerId) : Promise<Result<ApplyOutcome, ValidationError[]>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_listener", { id }) };
@@ -764,7 +772,7 @@ export type InterfaceMode = "Simple" | "Full"
 export type InterruptionView = { at_unix: number; reason: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 export type LaunchOutcome = "Launched" | "Focused"
-export type Listener = { id: ListenerId; name: string; listener_type: ListenerType; listen: string; port: number; auth: Auth | null; exit: ExitId | null; user_enabled: boolean; routing?: ListenerRouting | null; hidden?: boolean }
+export type Listener = { id: ListenerId; name: string; listener_type: ListenerType; listen: string; port: number; auth: Auth | null; exit: ExitId | null; user_enabled: boolean; routing?: ListenerRouting | null; hidden?: boolean; inherit_shared_rules?: boolean }
 export type ListenerId = string
 /**
  * Per-port routing; None preserves legacy uniform forwarding.
@@ -782,7 +790,7 @@ export type ManualNodeKind =
  * 原样的 mihomo proxy 映射
  */
 { Proxy: { raw: JsonValue } } | { Tailscale: TailscaleOpts }
-export type Model = { subscriptions: Subscription[]; exits: Exit[]; listeners: Listener[]; settings: Settings; manual_nodes: ManualNode[]; node_groups: NodeGroup[]; process_routing: ProcessRouting }
+export type Model = { subscriptions: Subscription[]; exits: Exit[]; listeners: Listener[]; settings: Settings; manual_nodes: ManualNode[]; node_groups: NodeGroup[]; process_routing: ProcessRouting; shared_rules?: SharedRule[]; shared_rule_providers?: SharedRuleProvider[] }
 /**
  * Why a target failed a round.
  */
@@ -925,7 +933,15 @@ export type ProjectLink = "Website" | "GitHub"
  */
 export type Rate = { up: number; down: number }
 export type RuleAction = "Proxy" | "Direct" | "Reject"
-export type RuleMatch = "Domain" | "DomainSuffix" | "Ipv4Cidr"
+export type RuleMatch = "Domain" | "DomainSuffix" | "Ipv4Cidr" | "Geosite" | "Geoip" | "RuleSet"
+
+export type RuleProviderBehavior = "Domain" | "IpCidr" | "Classical"
+
+export type RuleProviderFormat = "Yaml" | "Text" | "Mrs"
+
+export type SharedRule = { enabled: boolean; matcher: RuleMatch; value: string; action: RuleAction }
+
+export type SharedRuleProvider = { name: string; url: string; behavior: RuleProviderBehavior; format: RuleProviderFormat; interval: number }
 /**
  * Why the rule dialog's save failed: field errors for the form, or a message.
  */

@@ -142,6 +142,9 @@ impl SvcConn for PipeConn {
 /// 失败时返回此刻的组件状态：管道不存在时按服务是否存在、是否在运行给出
 /// `NotInstalled` / `Stopped`；拒绝访问为 `OwnedByOtherUser`；版本不一致为 `NeedsUpdate`。
 pub async fn connect() -> Result<Box<dyn SvcConn>, ComponentState> {
+    if crate::IS_RULES_PREVIEW {
+        return Err(ComponentState::NotInstalled);
+    }
     handshake(Box::new(open_pipe()?)).await
 }
 
@@ -657,6 +660,9 @@ impl ServiceOperations {
 }
 
 pub fn service_operation() -> Result<ServiceOperation<'static>, String> {
+    if crate::IS_RULES_PREVIEW {
+        return Err("共享规则预览版不会操作正式版的进程分流服务".into());
+    }
     OPERATIONS.begin()
 }
 

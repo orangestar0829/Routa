@@ -86,6 +86,42 @@ describe("ListenerDialog V4.3", () => {
     expect(screen.queryByLabelText("出口")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("监听地址")).not.toBeInTheDocument();
   });
+  it("keeps inheritance off by default and saves an opt-in on a direct port", async () => {
+    renderDialog(listener);
+    await modelLoaded();
+    const inherit = screen.getByRole("checkbox", { name: "继承共享规则" });
+    expect(inherit).not.toBeChecked();
+    fireEvent.click(inherit);
+    expect(screen.getByText(/匹配顺序：共享规则 → 直连/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "save_proxy",
+      expect.objectContaining({
+        l: expect.objectContaining({ routing: null, inherit_shared_rules: true }),
+        target: expect.objectContaining({ kind: "Direct" }),
+      }),
+    ));
+  });
+  it("tests local rules first and avoids a false fallback for a core-only shared rule", async () => {
+    vi.mocked(commands.getModel).mockResolvedValue({
+      ...model,
+      shared_rules: [{ enabled: true, matcher: "Geosite", value: "cn", action: "Direct" }],
+    });
+    renderDialog({ ...listener, inherit_shared_rules: true, routing: {
+      rules: [{ matcher: "DomainSuffix", value: "example.com", action: "Reject" }],
+      unmatched: "Proxy",
+    } });
+    await modelLoaded();
+    expect(screen.getByText(/端口规则 → 共享规则 → 未匹配去向/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("验证规则"));
+    fireEvent.change(screen.getByLabelText("域名或 IPv4 地址"), { target: { value: "www.example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "验证" }));
+    expect(screen.getByText("匹配 端口规则：example.com → 阻断")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("域名或 IPv4 地址"), { target: { value: "elsewhere.test" } });
+    fireEvent.click(screen.getByRole("button", { name: "验证" }));
+    expect(screen.getByText("共享规则的 GEOSITE 由内核匹配，此处无法离线验证。")).toBeInTheDocument();
+    expect(screen.queryByText(/未匹配规则 →/)).not.toBeInTheDocument();
+  });
   it("commits listener and private destination together without navigation", async () => {
     const close = renderDialog(listener);
     await modelLoaded();

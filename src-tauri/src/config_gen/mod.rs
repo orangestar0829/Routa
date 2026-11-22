@@ -3,7 +3,7 @@
 //! so any name round-trips; key order is fixed so output is byte-stable.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 use serde_yaml_ng::{Mapping, Value};
@@ -11,6 +11,39 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::model::health::{ExitHealth, ExitStatus, Health, ListenerStatus};
 use crate::model::*;
 use crate::netif::NetInterface;
+
+fn route_keyword(matcher: &RuleMatch) -> &'static str {
+    match matcher {
+        RuleMatch::Domain => "DOMAIN",
+        RuleMatch::DomainSuffix => "DOMAIN-SUFFIX",
+        RuleMatch::Ipv4Cidr => "IP-CIDR",
+        RuleMatch::Geosite => "GEOSITE",
+        RuleMatch::Geoip => "GEOIP",
+        RuleMatch::RuleSet => "RULE-SET",
+    }
+}
+
+fn rule_provider_yaml(provider: &SharedRuleProvider) -> Value {
+    let behavior = match provider.behavior {
+        RuleProviderBehavior::Domain => "domain",
+        RuleProviderBehavior::IpCidr => "ipcidr",
+        RuleProviderBehavior::Classical => "classical",
+    };
+    let format = match provider.format {
+        RuleProviderFormat::Yaml => "yaml",
+        RuleProviderFormat::Text => "text",
+        RuleProviderFormat::Mrs => "mrs",
+    };
+    // Leave the path to mihomo: it uses a URL-derived cache path in its home.
+    map(vec![
+        ("type", s("http")),
+        ("url", s(&provider.url)),
+        ("behavior", s(behavior)),
+        ("format", s(format)),
+        ("interval", Value::from(provider.interval)),
+        ("size-limit", Value::from(16 * 1024 * 1024_u32)),
+    ])
+}
 
 pub struct GenInput<'a> {
     pub model: &'a Model,
@@ -435,6 +468,10 @@ pub fn generate(input: &GenInput) -> Generated {
     }
 
     let mut sub_rules = Mapping::new();
+    let provider_config: BTreeMap<_, _> = model.shared_rule_providers.iter()
+        .map(|provider| (provider.name.as_str(), rule_provider_yaml(provider)))
+        .collect();
+    let mut used_providers = BTreeSet::new();
     let mut listeners = Vec::new();
     let mut plan = BTreeMap::new();
     for l in &model.listeners {
@@ -459,10 +496,13 @@ pub fn generate(input: &GenInput) -> Generated {
         }
         let mut fingerprint_fields = own.clone();
         fingerprint_fields.push(("routing", json_to_yaml(&serde_json::to_value(&l.routing).expect("routing"))));
-        let listener_fingerprint = hash_yaml(&map(fingerprint_fields));
         let mut entries = vec![("name", s(&l.name))];
         entries.extend(own.drain(..3));
-        if let Some(routing) = &l.routing {
+
+        let inherited: Vec<_> = model.shared_rules.iter()
+            .filter(|rule| l.inherit_shared_rules && !l.hidden && rule.enabled)
+            .collect();
+        if l.routing.is_some() || !inherited.is_empty() {
             let alias = format!("__port_{}", l.id.0);
             let target_alias = format!("__target_{}", l.id.0);
             groups.push(map(vec![("name", s(&target_alias)), ("type", s("select")), ("proxies", Value::Sequence(vec![s(&exit.name)]))]));
@@ -471,16 +511,37 @@ pub fn generate(input: &GenInput) -> Generated {
             if let Some(nic) = input.health.exits.get(&exit.id).and_then(|h| h.interface.as_ref()) { direct.push(("interface-name", s(&nic.mihomo_name))); }
             proxies.push(map(direct));
             let action = |a: &RuleAction| match a { RuleAction::Proxy => target_alias.as_str(), RuleAction::Direct => direct_alias.as_str(), RuleAction::Reject => "REJECT" };
-            let mut rules: Vec<Value> = routing.rules.iter().map(|r| {
-                let ty = match r.matcher { RuleMatch::Domain => "DOMAIN", RuleMatch::DomainSuffix => "DOMAIN-SUFFIX", RuleMatch::Ipv4Cidr => "IP-CIDR" };
-                s(&format!("{},{},{}", ty, r.value, action(&r.action)))
+
+            let local = l.routing.iter().flat_map(|routing| routing.rules.iter())
+                .map(|rule| (&rule.matcher, rule.value.as_str(), &rule.action));
+            let shared = inherited.iter().copied()
+                .map(|rule| (&rule.matcher, rule.value.as_str(), &rule.action));
+            let mut effective_providers = Mapping::new();
+            let mut rules: Vec<Value> = local.chain(shared).map(|(matcher, value, r_action)| {
+                if *matcher == RuleMatch::RuleSet {
+                    if let Some(provider) = provider_config.get(value) {
+                        used_providers.insert(value);
+                        effective_providers.insert(s(value), provider.clone());
+                    }
+                    // An invalid reference in manually edited persisted JSON
+                    // must be rejected by the core, not silently skipped.
+                }
+                s(&format!("{},{},{}", route_keyword(matcher), value, action(r_action)))
             }).collect();
-            rules.push(s(&format!("MATCH,{}", action(&routing.unmatched))));
+            let unmatched = l.routing.as_ref().map_or(&RuleAction::Proxy, |routing| &routing.unmatched);
+            rules.push(s(&format!("MATCH,{}", action(unmatched))));
+            if !inherited.is_empty() {
+                fingerprint_fields.push(("effective-rules", Value::Sequence(rules.clone())));
+            }
+            if !effective_providers.is_empty() {
+                fingerprint_fields.push(("effective-providers", Value::Mapping(effective_providers)));
+            }
             sub_rules.insert(s(&alias), Value::Sequence(rules));
             entries.push(("rule", s(&alias)));
         } else {
             entries.push(("proxy", s(&exit.name)));
         }
+        let listener_fingerprint = hash_yaml(&map(fingerprint_fields));
         entries.extend(own);
         listeners.push(map(entries));
         plan.insert(
@@ -517,6 +578,11 @@ pub fn generate(input: &GenInput) -> Generated {
 
     let mut root: Value = serde_yaml_ng::from_str(&base_config(model.settings.controller_port, input.secret, proxies, groups, listeners)).expect("generated config");
     if !sub_rules.is_empty() { root["sub-rules"] = Value::Mapping(sub_rules); }
+    if !used_providers.is_empty() {
+        root["rule-providers"] = Value::Mapping(used_providers.into_iter().map(|name| {
+            (s(name), provider_config[name].clone())
+        }).collect());
+    }
     Generated {
         yaml: serde_yaml_ng::to_string(&root).expect("routing config"),
         plan: EffectivePlan { listeners: plan },
@@ -641,6 +707,7 @@ mod tests {
         };
         let lis = |id: &str, name: &str, t, listen: &str, port, auth, e: &str| Listener {
             routing: None,
+            inherit_shared_rules: false,
             hidden: false,
             id: ListenerId(id.into()),
             name: name.into(),
@@ -687,6 +754,8 @@ mod tests {
             manual_nodes: vec![],
             node_groups: vec![],
             process_routing: ProcessRouting::default(),
+            shared_rules: vec![],
+            shared_rule_providers: vec![],
         }
     }
     fn gen_with(m: &Model, nics: &[NetInterface], fetch: &[(ExitId, u16)]) -> Generated {
@@ -770,6 +839,77 @@ mod tests {
         let after = generate(&GenInput { model: &m, health: &h, secret: "test", fetch_listeners: &[], nics: &[] });
         assert_ne!(before, after.plan.listeners["rules-port"].listener_fingerprint);
         assert_eq!(g.plan.listeners["forward-port"], after.plan.listeners["forward-port"]);
+    }
+
+    fn remote_provider(name: &str) -> SharedRuleProvider {
+        SharedRuleProvider {
+            name: name.into(), url: format!("https://example.com/{name}.mrs"),
+            behavior: RuleProviderBehavior::Domain, format: RuleProviderFormat::Mrs, interval: 86400,
+        }
+    }
+
+    #[test]
+    fn shared_rules_follow_local_overrides_and_keep_nic_and_fallback() {
+        let mut m = base();
+        m.shared_rule_providers = vec![remote_provider("domains"), remote_provider("unused")];
+        m.shared_rules = vec![
+            SharedRule { enabled: true, matcher: RuleMatch::Geosite, value: "cn".into(), action: RuleAction::Direct },
+            SharedRule { enabled: true, matcher: RuleMatch::Geoip, value: "CN".into(), action: RuleAction::Direct },
+            SharedRule { enabled: false, matcher: RuleMatch::RuleSet, value: "unused".into(), action: RuleAction::Reject },
+            SharedRule { enabled: true, matcher: RuleMatch::RuleSet, value: "domains".into(), action: RuleAction::Proxy },
+        ];
+        let unused = gen(&m);
+        assert!(parse(&unused.yaml).get("rule-providers").is_none());
+        m.listeners[0].inherit_shared_rules = true;
+        m.listeners[0].routing = Some(ListenerRouting {
+            rules: vec![PortRule { matcher: RuleMatch::Domain, value: "local.example".into(), action: RuleAction::Reject }],
+            unmatched: RuleAction::Direct,
+        });
+        let out = gen(&m);
+        let cfg = parse(&out.yaml);
+        assert_eq!(cfg["listeners"][0]["rule"], "__port_la");
+        assert_eq!(cfg["listeners"][1]["proxy"], "出口B");
+        assert_eq!(cfg["sub-rules"]["__port_la"], serde_yaml_ng::to_value([
+            "DOMAIN,local.example,REJECT",
+            "GEOSITE,cn,__direct_la",
+            "GEOIP,CN,__direct_la",
+            "RULE-SET,domains,__target_la",
+            "MATCH,__direct_la",
+        ]).unwrap());
+        let nic = nics().into_iter().find(|nic| nic.guid.0 == "{G1}").unwrap();
+        assert_eq!(find(&cfg, "proxies", "__direct_la").unwrap()["interface-name"], nic.mihomo_name.as_str());
+        assert_eq!(cfg["rule-providers"]["domains"]["type"], "http");
+        assert_eq!(cfg["rule-providers"]["domains"]["behavior"], "domain");
+        assert_eq!(cfg["rule-providers"]["domains"]["format"], "mrs");
+        assert_eq!(cfg["rule-providers"]["domains"]["interval"], 86400);
+        assert!(cfg["rule-providers"].get("unused").is_none());
+        assert_ne!(unused.plan.listeners["入口A"].listener_fingerprint, out.plan.listeners["入口A"].listener_fingerprint);
+        assert_eq!(unused.plan.listeners["入口B"], out.plan.listeners["入口B"]);
+
+        m.shared_rule_providers[0].url = "https://example.com/updated.mrs".into();
+        let updated = gen(&m);
+        assert_ne!(out.plan.listeners["入口A"].listener_fingerprint, updated.plan.listeners["入口A"].listener_fingerprint);
+        assert_eq!(out.plan.listeners["入口B"], updated.plan.listeners["入口B"]);
+        m.shared_rule_providers[1].interval += 1;
+        assert_eq!(updated.plan.listeners, gen(&m).plan.listeners);
+    }
+
+    #[test]
+    fn inherit_only_defaults_to_port_exit_and_does_not_change_subscription_fetch() {
+        let mut m = base();
+        m.shared_rules.push(SharedRule {
+            enabled: true, matcher: RuleMatch::DomainSuffix, value: "example.com".into(),
+            action: RuleAction::Reject,
+        });
+        m.listeners[0].inherit_shared_rules = true;
+        let nics = nics();
+        let fetch = vec![(m.exits[0].id.clone(), 24000)];
+        let cfg = parse(&gen_with(&m, &nics, &fetch).yaml);
+        assert_eq!(cfg["sub-rules"]["__port_la"][1], "MATCH,__target_la");
+        assert_eq!(find(&cfg, "listeners", "__fetch__ea").unwrap()["proxy"], "出口A");
+        m.listeners[0].hidden = true;
+        let cfg = parse(&gen(&m).yaml);
+        assert!(cfg.get("sub-rules").is_none());
     }
 
     #[test]

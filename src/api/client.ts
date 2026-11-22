@@ -126,6 +126,7 @@ export function useGroupNow(names: string[]) {
 }
 
 export const useSaveListener = make(() => commands.saveListener);
+export const useSaveSharedRouting = make(() => commands.saveSharedRouting);
 export const useDeleteListener = make(() => commands.deleteListener);
 export const useSaveExit = make(() => commands.saveExit);
 export const useDeleteExit = make(() => commands.deleteExit);

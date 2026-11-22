@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use routa_lib::core::api::{HttpMihomoApi, MihomoApi};
 use routa_lib::core::ports::WindowsPortOwners;
 use routa_lib::core::process::{CoreLauncher, CoreState, ProcessLauncher};
-use routa_lib::model::{Exit, ExitId, ExitKind, Listener, Model, Settings};
+use routa_lib::model::{
+    Exit, ExitId, ExitKind, Listener, ListenerRouting, Model, PortRule, RuleAction, RuleMatch,
+    RuleProviderBehavior, RuleProviderFormat, Settings, SharedRule, SharedRuleProvider,
+};
 use routa_lib::netif::WindowsInterfaces;
 use routa_lib::runtime::{ApiFor, LauncherFor, Runtime};
 use routa_lib::store::Store;
@@ -39,6 +42,25 @@ fn spawn_target(delay: Duration) -> u16 {
                 std::thread::sleep(delay);
                 let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
             });
+        }
+    });
+    port
+}
+
+fn spawn_rule_provider() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let body = b"payload:\n  - '127.0.0.1/32'\n";
+        for mut socket in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+            if socket.read(&mut buf).unwrap_or(0) == 0 {
+                continue;
+            }
+            let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/yaml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = socket.write_all(headers.as_bytes());
+            let _ = socket.write_all(body);
         }
     });
     port
@@ -115,6 +137,7 @@ async fn real_core_two_listeners_direct_exit() {
     let exit = Exit { id: ExitId::new(), name: "直连".into(), kind: ExitKind::Direct, interface: None, hidden: false };
     let mut l1 = Listener::new_default("监听一".into(), p1);
     l1.exit = Some(exit.id.clone());
+    let l1_id = l1.id.clone();
     let mut l2 = Listener::new_default("监听二".into(), p2);
     l2.exit = Some(exit.id.clone());
     let l2_id = l2.id.clone();
@@ -191,6 +214,78 @@ async fn real_core_two_listeners_direct_exit() {
     assert!(seen, "no connection with inboundName 监听一 seen");
     println!("/connections showed inboundName=监听一");
     assert_eq!(h.await.unwrap(), "204");
+
+    // An opt-in shared rule changes only listener 1. Its local exception
+    // must then take precedence over the shared rule.
+    rt.mutate(|m| {
+        m.shared_rules = vec![SharedRule {
+            enabled: true,
+            matcher: RuleMatch::Ipv4Cidr,
+            value: "127.0.0.1/32".into(),
+            action: RuleAction::Reject,
+        }];
+        m.listeners.iter_mut().find(|l| l.id == l1_id).unwrap().inherit_shared_rules = true;
+    })
+    .await
+    .expect("apply shared routing");
+    assert!(rt.status().failed_listeners.is_empty(), "{:?}", rt.status().failed_listeners);
+    assert!(!refuses(p1), "inheriting listener must stay open");
+    let url = format!("http://127.0.0.1:{t}/");
+    let probe = url.clone();
+    let (first, second) = tokio::task::spawn_blocking(move || {
+        (curl_status(p1, &probe), curl_status(p2, &probe))
+    })
+    .await
+    .unwrap();
+    assert_ne!(first, "204", "shared reject must apply to its inheriting listener");
+    assert_eq!(second, "204", "non-inheriting listener must remain unchanged");
+
+    rt.mutate(|m| {
+        m.listeners.iter_mut().find(|l| l.id == l1_id).unwrap().routing = Some(ListenerRouting {
+            rules: vec![PortRule {
+                matcher: RuleMatch::Ipv4Cidr,
+                value: "127.0.0.1/32".into(),
+                action: RuleAction::Direct,
+            }],
+            unmatched: RuleAction::Proxy,
+        });
+    })
+    .await
+    .expect("apply local exception");
+    let probe = url.clone();
+    let code = tokio::task::spawn_blocking(move || curl_status(p1, &probe)).await.unwrap();
+    assert_eq!(code, "204", "local exception must override the shared reject");
+
+    // Serve a real YAML rule provider locally, so the RuleSet test does not
+    // depend on the runner's access to a third-party rules site.
+    let rules_port = spawn_rule_provider();
+    rt.mutate(|m| {
+        m.shared_rules = vec![SharedRule {
+            enabled: true,
+            matcher: RuleMatch::RuleSet,
+            value: "loopback-fixture".into(),
+            action: RuleAction::Reject,
+        }];
+        m.shared_rule_providers = vec![SharedRuleProvider {
+            name: "loopback-fixture".into(),
+            url: format!("http://127.0.0.1:{rules_port}/rules.yaml"),
+            behavior: RuleProviderBehavior::IpCidr,
+            format: RuleProviderFormat::Yaml,
+            interval: 3600,
+        }];
+        m.listeners.iter_mut().find(|l| l.id == l1_id).unwrap().routing = None;
+    })
+    .await
+    .expect("apply remote ruleset");
+    assert!(rt.status().failed_listeners.is_empty(), "{:?}", rt.status().failed_listeners);
+    assert!(!refuses(p1), "ruleset listener must stay open");
+    let (first, second) = tokio::task::spawn_blocking(move || {
+        (curl_status(p1, &url), curl_status(p2, &url))
+    })
+    .await
+    .unwrap();
+    assert_ne!(first, "204", "the real provider must block through listener 1");
+    assert_eq!(second, "204", "the rule provider must not affect listener 2");
 
     // 3. Disable listener 2 -> its port refuses connections; listener 1 still works.
     assert!(!refuses(p2));

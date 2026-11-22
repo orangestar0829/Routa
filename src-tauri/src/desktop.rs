@@ -624,6 +624,9 @@ impl Desktop {
         mode: Option<CaptureMode>,
         listener_override: Option<ListenerId>,
     ) -> Result<DesktopState, String> {
+        if crate::IS_RULES_PREVIEW && mode.is_some() {
+            return Err("共享规则预览版仅支持手动配置代理端口，不接管系统流量".into());
+        }
         let _guard = self.operation.lock().await;
         let previous = *self.active.lock().unwrap();
         let previous_listener = self.active_system_listener.lock().unwrap().clone();

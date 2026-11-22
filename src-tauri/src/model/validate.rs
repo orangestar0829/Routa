@@ -343,19 +343,105 @@ fn validate_manual(model: &Model, errors: &mut Vec<ValidationError>) {
     }
 }
 
-pub fn validate(model: &Model) -> Result<(), Vec<ValidationError>> {
-    let mut errors = Vec::new();
+fn valid_provider_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+}
+
+fn valid_provider_url(value: &str) -> bool {
+    value.len() <= 2048
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+        && value.split_once("://").is_some_and(|(scheme, rest)| {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+                && !authority.is_empty() && !authority.contains('@')
+        })
+        && url::Url::parse(value).is_ok_and(|url| {
+            url.has_host() && url.username().is_empty() && url.password().is_none()
+                && url.fragment().is_none()
+        })
+}
+
+fn validate_routing(model: &Model, errors: &mut Vec<ValidationError>) {
+    use std::collections::HashSet;
+    let mut providers = HashSet::new();
+    for p in &model.shared_rule_providers {
+        let invalid = if !valid_provider_name(&p.name) {
+            Some("规则集名称需为 1–64 位字母、数字、下划线、点或连字符，并以字母或数字开头")
+        } else if !valid_provider_url(&p.url) {
+            Some("规则集地址需为不含账号、密码或片段的 HTTP(S) URL")
+        } else if p.format == RuleProviderFormat::Mrs && p.behavior == RuleProviderBehavior::Classical {
+            Some("MRS 规则集只支持域名或 IP CIDR 类型")
+        } else {
+            None
+        };
+        if let Some(reason) = invalid {
+            errors.push(ValidationError::InvalidProxy {
+                name: p.name.clone(), reason: reason.to_owned(),
+            });
+        }
+        if !(60..=31_536_000).contains(&p.interval) {
+            errors.push(ValidationError::IntervalOutOfRange {
+                field: format!("rule_providers[{}].interval", p.name), value: p.interval,
+            });
+        }
+        if !providers.insert(p.name.as_str()) {
+            errors.push(ValidationError::DuplicateName {
+                kind: "规则集", name: p.name.clone(),
+            });
+        }
+    }
+
+    let check = |owner: &str, matcher: &RuleMatch, value: &str, errors: &mut Vec<ValidationError>| {
+        let valid = match matcher {
+            RuleMatch::Domain | RuleMatch::DomainSuffix => !value.is_empty()
+                && value.len() <= 253
+                && value.split('.').all(|part| !part.is_empty()
+                    && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')),
+            RuleMatch::Ipv4Cidr => value.split_once('/').is_some_and(|(ip, bits)| {
+                ip.parse::<std::net::Ipv4Addr>().is_ok()
+                    && bits.parse::<u8>().is_ok_and(|n| n <= 32)
+            }),
+            RuleMatch::Geosite => value.len() <= 128 && value.split('@').all(|tag| {
+                let t = tag.strip_prefix('!').unwrap_or(tag);
+                !t.is_empty() && t.as_bytes()[0].is_ascii_alphanumeric()
+                    && t.bytes().all(|c| c.is_ascii_alphanumeric() || b"_.-!".contains(&c))
+            }),
+            RuleMatch::Geoip => {
+                !value.is_empty() && value.len() <= 64 && value.as_bytes()[0].is_ascii_alphanumeric()
+                    && value.bytes().all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+            }
+            RuleMatch::RuleSet => valid_provider_name(value),
+        };
+        if !valid {
+            errors.push(ValidationError::InvalidProxy {
+                name: owner.to_owned(),
+                reason: format!("无效的 {:?} 规则值：{}", matcher, value),
+            });
+        } else if *matcher == RuleMatch::RuleSet && !providers.contains(value) {
+            errors.push(ValidationError::DanglingRef {
+                what: format!("{owner} → 规则集 {value}"),
+            });
+        }
+    };
+
     for l in &model.listeners {
         if let Some(routing) = &l.routing {
             for r in &routing.rules {
-                let valid = match r.matcher {
-                    RuleMatch::Domain | RuleMatch::DomainSuffix => !r.value.is_empty() && r.value.len() <= 253 && r.value.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')),
-                    RuleMatch::Ipv4Cidr => r.value.split_once('/').is_some_and(|(ip, bits)| ip.parse::<std::net::Ipv4Addr>().is_ok() && bits.parse::<u8>().is_ok_and(|n| n <= 32)),
-                };
-                if !valid { errors.push(ValidationError::InvalidProxy { name: l.name.clone(), reason: format!("无效的域名 / IPv4 CIDR 规则：{}", r.value) }); }
+                check(&l.name, &r.matcher, &r.value, errors);
             }
         }
     }
+    for (i, r) in model.shared_rules.iter().enumerate().filter(|(_, r)| r.enabled) {
+        check(&format!("共享规则 {}", i + 1), &r.matcher, &r.value, errors);
+    }
+}
+
+pub fn validate(model: &Model) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    validate_routing(model, &mut errors);
 
     check_unique("subscription", model.subscriptions.iter().map(|s| s.name.as_str()), &mut errors);
     check_unique("exit", model.exits.iter().map(|e| e.name.as_str()), &mut errors);
@@ -491,6 +577,51 @@ mod tests {
     fn errs(m: &Model) -> Vec<ValidationError> {
         validate(m).err().unwrap_or_default()
     }
+    fn provider() -> SharedRuleProvider {
+        SharedRuleProvider {
+            name: "test-rules".into(), url: "https://rules.example.test/list.mrs".into(),
+            behavior: RuleProviderBehavior::IpCidr, format: RuleProviderFormat::Mrs, interval: 3600,
+        }
+    }
+
+    #[test]
+    fn shared_rules_require_valid_payloads_and_existing_enabled_refs() {
+        let mut m = Model::default();
+        m.shared_rules = vec![
+            SharedRule { enabled: true, matcher: RuleMatch::Geosite, value: "geolocation-!cn@!ads".into(), action: RuleAction::Direct },
+            SharedRule { enabled: true, matcher: RuleMatch::Geoip, value: "CN".into(), action: RuleAction::Direct },
+            SharedRule { enabled: false, matcher: RuleMatch::RuleSet, value: "not-registered".into(), action: RuleAction::Reject },
+            SharedRule { enabled: false, matcher: RuleMatch::Domain, value: "".into(), action: RuleAction::Reject },
+        ];
+        assert!(validate(&m).is_ok());
+        m.shared_rules[2].enabled = true;
+        assert!(matches!(errs(&m).as_slice(), [ValidationError::DanglingRef { .. }]));
+        m.shared_rules[2].value = "test-rules".into();
+        m.shared_rule_providers.push(provider());
+        assert!(validate(&m).is_ok());
+        m.shared_rules[0].value = "cn,DIRECT".into();
+        assert!(matches!(errs(&m).as_slice(), [ValidationError::InvalidProxy { .. }]));
+    }
+
+    #[test]
+    fn rejects_non_http_provider_invalid_mrs_and_duplicate_names() {
+        let mut m = Model::default();
+        let mut p = provider();
+        for url in ["file:///tmp/list.mrs", "https://user:pw@example.com/rules", "https:///rules", "https://example.com/rules#fragment"] {
+            p.url = url.into();
+            m.shared_rule_providers = vec![p.clone()];
+            assert!(matches!(errs(&m).as_slice(), [ValidationError::InvalidProxy { .. }]));
+        }
+        let mut p = provider();
+        p.behavior = RuleProviderBehavior::Classical;
+        assert!(matches!(errs(&Model { shared_rule_providers: vec![p], ..Model::default() }).as_slice(), [ValidationError::InvalidProxy { .. }]));
+        let mut p = provider();
+        p.interval = 1;
+        assert!(matches!(errs(&Model { shared_rule_providers: vec![p], ..Model::default() }).as_slice(), [ValidationError::IntervalOutOfRange { .. }]));
+        m.shared_rule_providers = vec![provider(), provider()];
+        assert!(matches!(errs(&m).as_slice(), [ValidationError::DuplicateName { .. }]));
+    }
+
     fn count_invalid(m: &Model, name: &str) -> usize {
         errs(m)
             .iter()

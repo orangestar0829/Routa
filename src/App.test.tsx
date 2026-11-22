@@ -51,6 +51,7 @@ describe("App", () => {
     expect(labels).toEqual([
       "概览",
       "代理",
+      "共享规则",
       "AI 应用",
       "进程分流",
       "订阅",
@@ -58,6 +59,13 @@ describe("App", () => {
       "设置",
     ]);
   });
+});
+
+it("opens the shared rules workspace from its navigation link", async () => {
+  render(<App />);
+  const nav = await screen.findByRole("navigation", { name: "主导航" });
+  fireEvent.click(within(nav).getByRole("link", { name: "共享规则" }));
+  expect(await screen.findByRole("heading", { name: "共享规则" })).toBeInTheDocument();
 });
 
 describe("Layout sidebar", () => {

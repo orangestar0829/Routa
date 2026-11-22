@@ -192,13 +192,15 @@ pub struct Listener {
     #[serde(default)]
     #[specta(optional)]
     pub routing: Option<ListenerRouting>,
+    #[specta(optional)]
+    pub inherit_shared_rules: bool,
     // 进程分流按节点自动创建的监听器：不在监听器页显示，没有规则引用时自动删除。
     // `default` must follow `skip_serializing_if`: specta resets `optional` on the latter.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub hidden: bool,
 }
 
-/// Per-port routing; None preserves legacy uniform forwarding.
+/// Local per-port rules and fallback; independent of shared-rule opt-in.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 pub struct ListenerRouting {
     pub rules: Vec<PortRule>,
@@ -207,7 +209,7 @@ pub struct ListenerRouting {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 pub enum RuleAction { Proxy, Direct, Reject }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
-pub enum RuleMatch { Domain, DomainSuffix, Ipv4Cidr }
+pub enum RuleMatch { Domain, DomainSuffix, Ipv4Cidr, Geosite, Geoip, RuleSet }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 pub struct PortRule {
     pub matcher: RuleMatch,
@@ -256,9 +258,42 @@ impl Listener {
             exit: None,
             user_enabled: true,
             routing: None,
+            inherit_shared_rules: false,
             hidden: false,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
+pub struct SharedRule {
+    pub enabled: bool,
+    pub matcher: RuleMatch,
+    pub value: String,
+    pub action: RuleAction,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
+pub enum RuleProviderBehavior {
+    Domain,
+    IpCidr,
+    Classical,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
+pub enum RuleProviderFormat {
+    Yaml,
+    Text,
+    Mrs,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
+pub struct SharedRuleProvider {
+    pub name: String,
+    pub url: String,
+    pub behavior: RuleProviderBehavior,
+    pub format: RuleProviderFormat,
+    /// Mihomo update interval in seconds.
+    pub interval: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
@@ -387,6 +422,10 @@ pub struct Model {
     pub subscriptions: Vec<Subscription>,
     pub exits: Vec<Exit>,
     pub listeners: Vec<Listener>,
+    #[specta(optional)]
+    pub shared_rules: Vec<SharedRule>,
+    #[specta(optional)]
+    pub shared_rule_providers: Vec<SharedRuleProvider>,
     pub settings: Settings,
     pub manual_nodes: Vec<ManualNode>,
     pub node_groups: Vec<NodeGroup>,
@@ -523,6 +562,21 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"autostart":true,"controller_port":19097}"#).unwrap();
         assert!(s.autostart);
         assert_eq!(s.node_monitor, NodeMonitorSettings::default());
+    }
+
+    #[test]
+    fn legacy_model_loads_routing_without_shared_opt_in() {
+        let m: Model = serde_json::from_str(r#"{
+            "listeners":[{"id":"legacy","name":"local","port":1080,"routing":{
+                "rules":[{"matcher":"DomainSuffix","value":"example.com","action":"Direct"}],
+                "unmatched":"Reject"
+            }}]
+        }"#).unwrap();
+        assert!(m.shared_rules.is_empty() && m.shared_rule_providers.is_empty());
+        assert!(!m.listeners[0].inherit_shared_rules);
+        let routing = m.listeners[0].routing.as_ref().unwrap();
+        assert_eq!(routing.rules[0].matcher, RuleMatch::DomainSuffix);
+        assert_eq!(routing.unmatched, RuleAction::Reject);
     }
 
     #[test]
@@ -684,6 +738,8 @@ mod tests {
                 },
             ],
             listeners: vec![l],
+            shared_rules: vec![],
+            shared_rule_providers: vec![],
             settings: Settings::default(),
             manual_nodes: vec![proxy_node, ts_node],
             node_groups: vec![group],
