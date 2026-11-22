@@ -76,41 +76,45 @@ const evaluate = async (expression) => {
 };
 const expression = (fn, ...args) => `(${fn.toString()})(...${JSON.stringify(args)})`;
 
-function locate(selector, label, partial, input) {
+function locate(selector, label, partial, input, operation) {
   const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim();
   for (const match of document.querySelectorAll(selector)) {
-    const names = [match.innerText, match.getAttribute("aria-label")].map(normalize);
-    if (!names.some((name) => partial ? name.includes(label) : name === label)) continue;
+    const names = [match.innerText, match.textContent, match.getAttribute("aria-label")].map(normalize);
+    if (label && !names.some((name) => partial ? name.includes(label) : name === label)) continue;
     const el = input ? (match.control || match.querySelector("input")) : match;
     if (!el || el.disabled || el.getAttribute("aria-disabled") === "true" ||
         el.getClientRects().length === 0) continue;
     el.scrollIntoView({ block: "center", inline: "nearest" });
-    const r = el.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2,
-      checked: el.checked ?? null, value: el.value ?? null };
+    if (operation === "click") el.click();
+    if (operation === "focus") el.focus();
+    return { checked: el.checked ?? null, value: el.value ?? null,
+      pressed: el.getAttribute("aria-pressed") === "true" };
   }
   return null;
 }
 
-async function find(selector, label, { partial = false, input = false } = {}) {
-  return wait(label, () => evaluate(expression(locate, selector, label, partial, input)));
+async function find(selector, label, { partial = false, input = false, operation } = {}) {
+  return wait(label || selector, () => evaluate(expression(locate, selector, label, partial, input, operation)));
 }
 
-async function click(selector, label, options) {
-  const { x, y } = await find(selector, label, options);
-  for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
-    await call("Input.dispatchMouseEvent", {
-      type, x, y, button: type === "mouseMoved" ? "none" : "left", clickCount: type === "mouseMoved" ? 0 : 1,
-    });
-  }
+async function click(selector, label, options = {}) {
+  await find(selector, label, { ...options, operation: "click" });
+}
+
+async function navigate(path) {
+  // Route anchors are not vulnerable to sidebar text/hit-testing differences.
+  const route = "#/" + path;
+  await click(`nav[aria-label="主导航"] a[href="${route}"]`);
+  await wait(`navigation to ${route}`, () => evaluate(expression((target) =>
+    location.hash === target, route)));
 }
 
 async function fill(label, value) {
-  await click("label", label, { input: true });
-  await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65 });
-  await call("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65 });
+  await find("label", label, { input: true, operation: "focus" });
+  await evaluate("document.activeElement.select()");
   await call("Input.insertText", { text: value });
-  await wait(label + " input", async () => (await find("label", label, { input: true })).value === value);
+  await wait(label + " input", () => evaluate(expression((expected) =>
+    document.activeElement?.value === expected, value)));
 }
 
 async function text(value) {
@@ -125,7 +129,9 @@ async function resize(width) {
 
 async function capture(stem) {
   await sleep(240);
-  const dimensions = await evaluate("({width: innerWidth, height: innerHeight})");
+  const dimensions = call
+    ? await evaluate("({width: innerWidth, height: innerHeight})").catch(() => ({}))
+    : {};
   let filename = stem + ".png";
   let method;
   try {
@@ -135,6 +141,7 @@ async function capture(stem) {
     method = stdout.trim().split(/\r?\n/).at(-1);
     if (!["windows-desktop", "windows-printwindow"].includes(method)) throw new Error("Native window capture didn't finish");
   } catch (error) {
+    if (!call) throw error;
     // Some hosted runners expose an off-screen desktop. This is still the
     // actual Windows app's rendered content, but omits the native title bar.
     console.warn(`Native frame capture unavailable for ${stem}; using real WebView2 surface: ${error.message}`);
@@ -188,19 +195,32 @@ try {
     socket.send(JSON.stringify({ id: request, method, params }));
   });
 
-  await click("button", "完整版", { partial: true });
-  await click("button", "开始使用");
-  await click("a,button", "代理");
+  report.stage = "select full mode";
+  const fullNavigation = 'nav[aria-label="主导航"]';
+  if (!await evaluate(expression((selector) => !!document.querySelector(selector), fullNavigation))) {
+    await click("button", "完整版", { partial: true });
+    await wait("full-mode choice selected", async () => (await evaluate(expression(
+      locate, "button", "完整版", true, false,
+    )))?.pressed);
+    await click("button", "开始使用");
+    await wait("full-mode navigation after onboarding", () => evaluate(expression((selector) =>
+      !!document.querySelector(selector), fullNavigation)));
+  }
+
+  report.stage = "proxy baseline";
+  await navigate("listeners");
   await find("button", "新增代理");
   await resize(1120);
   await wait("wide native window", async () => await evaluate("innerWidth") >= 1050);
   await capture("00-proxies-baseline");
 
-  await click("a,button", "共享规则");
+  report.stage = "shared rules empty";
+  await navigate("shared-routing");
   await find("button", "新增规则");
   await text("还没有共享规则");
   await capture("01-shared-rules-empty");
 
+  report.stage = "save a shared rule";
   await click("button", "新增规则");
   await text("新增共享规则");
   await fill("匹配内容", "windows-smoke.example");
@@ -212,7 +232,8 @@ try {
   await text("windows-smoke.example");
   await capture("02-shared-rules");
 
-  await click("a,button", "代理");
+  report.stage = "verify port inheritance";
+  await navigate("listeners");
   await click("button", "新增代理");
   await fill("名称", "Windows smoke");
   await click("[role=dialog] button", "直连");
@@ -229,7 +250,8 @@ try {
   const reopened = await find("[role=dialog] label", "继承共享规则", { input: true });
   if (!reopened.checked) throw new Error("Saved port no longer inherits shared rules");
   await click("[role=dialog] button", "取消");
-  await click("a,button", "共享规则");
+  report.stage = "narrow shared rules";
+  await navigate("shared-routing");
   await text("windows-smoke.example");
   await text("1 个代理继承");
 
@@ -237,9 +259,36 @@ try {
   await resize(940);
   await wait("actual narrower native window", async () => await evaluate("innerWidth") < baselineWidth - 20);
   await capture("04-shared-rules-narrow");
+  report.stage = "complete";
   report.status = "passed";
 } catch (error) {
   report.error = error.message;
+  if (call) {
+    try {
+      report.page = await evaluate(expression(() => ({
+        hash: location.hash,
+        readyState: document.readyState,
+        viewport: { width: innerWidth, height: innerHeight },
+        navigation: [...document.querySelectorAll("nav")].map((nav) => nav.getAttribute("aria-label")),
+        controls: [...document.querySelectorAll("h1,h2,nav a,button,[role=alert]")]
+          .filter((el) => el.getClientRects().length > 0)
+          .slice(0, 32)
+          .map((el) => ({
+            label: (el.getAttribute("aria-label") || el.innerText || "").trim().slice(0, 120),
+            pressed: el.getAttribute("aria-pressed"),
+            disabled: el.disabled ?? null,
+          })),
+      })));
+      console.error("Routa smoke UI state:", JSON.stringify(report.page));
+    } catch (diagnosticError) {
+      report.diagnosticError = diagnosticError.message;
+    }
+  }
+  if (app.pid && app.exitCode === null) {
+    await capture("99-smoke-failure").catch((captureError) => {
+      report.screenshotError = captureError.message;
+    });
+  }
   throw error;
 } finally {
   socket?.close();
