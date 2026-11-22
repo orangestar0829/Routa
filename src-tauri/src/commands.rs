@@ -60,6 +60,16 @@ pub mod ops {
         }).await
     }
 
+    /// Persist rule/provider changes together, so references cannot be half-applied.
+    pub async fn save_shared_routing(
+        rt: &Runtime, rules: Vec<SharedRule>, providers: Vec<SharedRuleProvider>,
+    ) -> CmdResult {
+        rt.mutate(|m| {
+            m.shared_rules = rules;
+            m.shared_rule_providers = providers;
+        }).await
+    }
+
     pub async fn delete_listener(rt: &Runtime, id: ListenerId) -> CmdResult {
         rt.mutate(|m| {
             let eid = m.listeners.iter().find(|l| l.id == id).and_then(|l| l.exit.clone());
@@ -381,6 +391,14 @@ pub fn get_status(rt: Rt<'_>) -> RuntimeStatus {
 #[specta::specta]
 pub async fn save_proxy(rt: Rt<'_>, l: Listener, target: Exit) -> CmdResult {
     ops::save_proxy(&rt, l, target).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_shared_routing(
+    rt: Rt<'_>, rules: Vec<SharedRule>, providers: Vec<SharedRuleProvider>,
+) -> CmdResult {
+    ops::save_shared_routing(&rt, rules, providers).await
 }
 
 #[tauri::command]
@@ -819,6 +837,27 @@ pub(crate) mod tests {
         let m=rt.model();assert!(m.listeners.is_empty());assert!(m.exits.is_empty());
         assert!(m.subscriptions[0].fallback_listener.is_none());assert!(m.subscriptions[0].fallback_exit.is_none());
     }
+    #[tokio::test]
+    async fn saves_shared_routing_atomically_and_rejects_dangling_refs() {
+        let td = tempfile::tempdir().unwrap();
+        let rt = runtime(&td);
+        let rule = SharedRule {
+            enabled: true, matcher: RuleMatch::RuleSet, value: "domains".into(), action: RuleAction::Direct,
+        };
+        let provider = SharedRuleProvider {
+            name: "domains".into(), url: "https://example.test/domains.mrs".into(),
+            behavior: RuleProviderBehavior::Domain, format: RuleProviderFormat::Mrs, interval: 3600,
+        };
+        assert!(ops::save_shared_routing(&rt, vec![rule.clone()], vec![]).await.is_err());
+        assert!(rt.model().shared_rules.is_empty());
+        ops::save_shared_routing(&rt, vec![rule.clone()], vec![provider]).await.unwrap();
+        let before = rt.model();
+        assert_eq!(before.shared_rules, vec![rule.clone()]);
+        assert_eq!(before.shared_rule_providers.len(), 1);
+        assert!(ops::save_shared_routing(&rt, vec![rule], vec![]).await.is_err());
+        assert_eq!(rt.model(), before);
+    }
+
     #[test]
     fn batch_yaml_preserves_nested_values_and_rejects_partial_invalid_input() {
         let parsed=ops::parse_proxy_yaml_batch("proxies:\n - {name: a, type: vless, ws-opts: {headers: {Host: example.test}}}\n - {name: b, type: http}".into()).unwrap();

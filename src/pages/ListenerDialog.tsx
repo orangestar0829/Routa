@@ -5,6 +5,7 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   DialogActions,
   DialogContent,
   DialogTitle,
@@ -15,6 +16,7 @@ import {
   TextField,
   ToggleButton,
   ToggleButtonGroup,
+  Tooltip,
   Typography,
 } from "@mui/material";
 import { useState } from "react";
@@ -39,6 +41,7 @@ import { FormDialog } from "../components/FormDialog";
 import { InterfacePicker } from "../components/InterfacePicker";
 import { MemberPicker } from "../components/MemberPicker";
 import { NodePicker } from "../components/NodePicker";
+import { ACTION_LABELS, MATCH_LABELS, RULE_ACTIONS, RULE_MATCHERS } from "../lib/sharedRouting";
 
 // `existing` must only contain visible listeners; candidates skip the hidden port range.
 function proposePort(existing: Listener[]) {
@@ -65,11 +68,6 @@ export function newListener(existing: Listener[]): Listener {
     user_enabled: true,
   };
 }
-const actions: [RuleAction, string][] = [
-  ["Proxy", "代理"],
-  ["Direct", "直连"],
-  ["Reject", "阻断"],
-];
 export function ListenerDialog({
   listener,
   onClose,
@@ -121,6 +119,9 @@ export function ListenerDialog({
       : { strategy: "UrlTest" as GroupStrategy, members: [], selected: null },
   );
   const [rules, setRules] = useState<PortRule[]>(l.routing?.rules ?? []);
+  const shared = m?.shared_rules?.filter((r) => r.enabled) ?? [];
+  const providers = m?.shared_rule_providers ?? [];
+  const inherits = !!l.inherit_shared_rules;
   const [unmatched, setUnmatched] = useState<RuleAction>(
     l.routing?.unmatched ?? "Proxy",
   );
@@ -176,6 +177,7 @@ export function ListenerDialog({
           : "127.0.0.1",
       port: p,
       routing: mode === "rules" ? { rules, unmatched } : null,
+      inherit_shared_rules: inherits,
     };
     try {
       await save.mutateAsync(next, { ...target, kind: destination });
@@ -188,23 +190,46 @@ export function ListenerDialog({
   };
   const verify = () => {
     const input = probe.trim().toLowerCase();
-    const match = rules.find((r) => {
-      const v = r.value.toLowerCase();
-      if (r.matcher === "Domain") return input === v;
-      if (r.matcher === "DomainSuffix")
-        return input === v || input.endsWith(`.${v}`);
-      const [ip, prefix] = v.split("/");
-      const num = (s: string) =>
-        s.split(".").reduce((a, b) => (a * 256 + Number(b)) >>> 0, 0);
-      const bits = Number(prefix);
-      return (
-        /^\d+\.\d+\.\d+\.\d+$/.test(input) &&
-        (bits === 0 || num(input) >>> (32 - bits) === num(ip) >>> (32 - bits))
-      );
-    });
-    setProbeResult(
-      `${match ? "匹配 " + match.value : "未匹配规则"} → ${actions.find(([a]) => a === (match?.action ?? unmatched))?.[1]}`,
-    );
+    if (!input) {
+      setProbeResult("请输入域名或 IPv4 地址");
+      return;
+    }
+    const ordered = [
+      ...rules.map((rule) => ({ rule, source: "端口规则" })),
+      ...(inherits ? shared.map((rule) => ({ rule, source: "共享规则" })) : []),
+    ];
+    const ipv4 = (value: string) => {
+      if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return null;
+      const octets = value.split(".").map(Number);
+      return octets.some((part) => part > 255)
+        ? null : octets.reduce((a, b) => (a * 256 + b) >>> 0, 0);
+    };
+    for (const { rule, source } of ordered) {
+      const v = rule.value.toLowerCase();
+      let hit: boolean;
+      if (rule.matcher === "Domain") hit = input === v;
+      else if (rule.matcher === "DomainSuffix") hit = input === v || input.endsWith(`.${v}`);
+      else if (rule.matcher === "Ipv4Cidr") {
+        const inputIp = ipv4(input);
+        if (inputIp === null) {
+          setProbeResult(`${source}的 IPv4 CIDR 需要内核解析目标的 IP，此处无法离线验证。`);
+          return;
+        }
+        const [ip, prefix] = v.split("/");
+        const network = ipv4(ip), bits = Number(prefix);
+        hit = network !== null && !!prefix && Number.isInteger(bits) && bits >= 0 && bits <= 32
+          && (bits === 0 || inputIp >>> (32 - bits) === network >>> (32 - bits));
+      } else {
+        setProbeResult(`${source}的 ${MATCH_LABELS[rule.matcher]} 由内核匹配，此处无法离线验证。`);
+        return;
+      }
+      if (hit) {
+        setProbeResult(`匹配 ${source}：${rule.value} → ${ACTION_LABELS[rule.action]}`);
+        return;
+      }
+    }
+    setProbeResult(inherits && !m ? "正在读取共享规则，无法验证未匹配去向。"
+      : `未匹配规则 → ${ACTION_LABELS[unmatched]}`);
   };
   return (
     <>
@@ -281,6 +306,26 @@ export function ListenerDialog({
                 ))}
               </ToggleButtonGroup>
             </Box>
+            <Box>
+              <FormControlLabel label="继承共享规则" control={
+                <Checkbox checked={inherits} onChange={(_, inherit_shared_rules) => {
+                  setL({ ...l, inherit_shared_rules });
+                  setProbeResult("");
+                }} />
+              } />
+              {inherits && (
+                <Tooltip title={mode === "direct" ? "共享规则中的「代理」使用此端口现有的直连出口。" : ""}>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+                    {mode === "rules"
+                      ? "匹配顺序：端口规则 → 共享规则 → 未匹配去向"
+                      : mode === "direct"
+                        ? "匹配顺序：共享规则 → 直连"
+                        : "匹配顺序：共享规则 → 统一转发"}
+                    {m && !shared.length ? "（暂无启用的共享规则）" : ""}
+                  </Typography>
+                </Tooltip>
+              )}
+            </Box>
             {mode !== "direct" && (
               <>
                 <TextField
@@ -344,7 +389,7 @@ export function ListenerDialog({
             )}
             {mode === "rules" && (
               <>
-                <Typography variant="subtitle2">按顺序匹配</Typography>
+                <Typography variant="subtitle2">端口规则（按顺序匹配）</Typography>
                 {rules.map((r, i) => (
                   <Box
                     key={i}
@@ -366,37 +411,32 @@ export function ListenerDialog({
                               j === i
                                 ? {
                                     ...x,
-                                    matcher: e.target
-                                      .value as PortRule["matcher"],
+                                    matcher: e.target.value as PortRule["matcher"],
+                                    value: e.target.value === "RuleSet" || x.matcher === "RuleSet" ? "" : x.value,
                                   }
                                 : x,
                             ),
                           )
                         }
                       >
-                        {[
-                          ["Domain", "完整域名"],
-                          ["DomainSuffix", "域名后缀"],
-                          ["Ipv4Cidr", "IPv4 CIDR"],
-                        ].map(([v, t]) => (
+                        {RULE_MATCHERS.map(([v, t]) => (
                           <MenuItem key={v} value={v}>
                             {t}
                           </MenuItem>
                         ))}
                       </TextField>
-                      <TextField
-                        label="匹配内容"
-                        value={r.value}
-                        onChange={(e) =>
-                          setRules(
-                            rules.map((x, j) =>
-                              j === i
-                                ? { ...x, value: e.target.value.trim() }
-                                : x,
-                            ),
-                          )
-                        }
-                      />
+                      {r.matcher === "RuleSet" ? (
+                        <TextField select label="匹配内容" value={r.value}
+                          helperText={!providers.length ? "先在「共享规则」中导入规则集" : undefined}
+                          onChange={(e) => setRules(rules.map((x, j) => j === i ? { ...x, value: e.target.value } : x))}>
+                          <MenuItem value="" disabled>选择规则集</MenuItem>
+                          {r.value && !providers.some((p) => p.name === r.value) && <MenuItem value={r.value} disabled>{r.value}（未导入）</MenuItem>}
+                          {providers.map((p) => <MenuItem key={p.name} value={p.name}>{p.name}</MenuItem>)}
+                        </TextField>
+                      ) : (
+                        <TextField label="匹配内容" value={r.value}
+                          onChange={(e) => setRules(rules.map((x, j) => j === i ? { ...x, value: e.target.value.trim() } : x))} />
+                      )}
                       <TextField
                         select
                         label="处理方式"
@@ -411,7 +451,7 @@ export function ListenerDialog({
                           )
                         }
                       >
-                        {actions.map(([v, t]) => (
+                        {RULE_ACTIONS.map(([v, t]) => (
                           <MenuItem key={v} value={v}>
                             {t}
                           </MenuItem>
@@ -444,7 +484,7 @@ export function ListenerDialog({
                   value={unmatched}
                   onChange={(e) => setUnmatched(e.target.value as RuleAction)}
                 >
-                  {actions.map(([v, t]) => (
+                  {RULE_ACTIONS.map(([v, t]) => (
                     <MenuItem key={v} value={v}>
                       {t}
                     </MenuItem>

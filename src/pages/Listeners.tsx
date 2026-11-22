@@ -112,6 +112,7 @@ export function Listeners() {
                   <Typography variant="caption" color="text.secondary">当前节点</Typography>
                   {target && <Chip label={strategy} sx={{ height: 20, fontSize: 11 }} />}
                   {listener.routing && <Chip label="规则分流" sx={{ height: 20, fontSize: 11 }} />}
+                  {listener.inherit_shared_rules && <Chip label="继承共享规则" sx={{ height: 20, fontSize: 11 }} />}
                 </Box>
                 {target && kind !== "Direct" ? <Tooltip title={switchable ? "点击切换节点" : "点击编辑节点配置"}>
                   <ButtonBase aria-label={switchable ? `切换 ${listener.name} 的节点` : `编辑 ${listener.name} 的节点配置`} aria-haspopup="dialog"

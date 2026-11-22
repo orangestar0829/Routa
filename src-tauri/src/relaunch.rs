@@ -90,6 +90,9 @@ fn spawn_elevated(_connect_tun: bool) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub async fn relaunch_as_admin(app: tauri::AppHandle, connect_tun: bool) -> Result<(), String> {
+    if crate::IS_RULES_PREVIEW {
+        return Err("共享规则预览版不会请求管理员权限".into());
+    }
     tokio::task::spawn_blocking(move || spawn_elevated(connect_tun))
         .await
         .map_err(|e| e.to_string())??;

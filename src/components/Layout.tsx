@@ -1,4 +1,5 @@
 import AltRouteOutlined from "@mui/icons-material/AltRouteOutlined";
+import ListAltOutlined from "@mui/icons-material/ListAltOutlined";
 import AutoAwesomeOutlined from "@mui/icons-material/AutoAwesomeOutlined";
 import SpaceDashboardOutlined from "@mui/icons-material/SpaceDashboardOutlined";
 import DnsOutlined from "@mui/icons-material/DnsOutlined";
@@ -28,6 +29,7 @@ const DRAWER_WIDTH = 184;
 export const pages = [
   { path: "/", label: "概览", icon: <SpaceDashboardOutlined /> },
   { path: "/listeners", label: "代理", icon: <SwapHorizOutlined /> },
+  { path: "/shared-routing", label: "共享规则", icon: <ListAltOutlined /> },
   { path: "/ai-apps", label: "AI 应用", icon: <AutoAwesomeOutlined /> },
   { path: "/process-routing", label: "进程分流", icon: <AltRouteOutlined /> },
   { path: "/subscriptions", label: "订阅", icon: <LanguageOutlined /> },

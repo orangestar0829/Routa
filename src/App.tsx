@@ -18,6 +18,7 @@ import { ExitConfirmDialog } from "./components/ExitConfirmDialog";
 import { Layout } from "./components/Layout";
 
 import { Listeners } from "./pages/Listeners";
+import { SharedRoutingPage } from "./pages/SharedRouting";
 import { FullOverview } from "./pages/FullOverview";
 import { AiAppsPage } from "./pages/AiApps";
 import { ProcessRoutingPage } from "./pages/ProcessRouting";
@@ -96,6 +97,7 @@ function ApplicationShell() {
       <Routes>
         <Route path="/" element={<FullOverview />} />
         <Route path="/listeners" element={<Listeners />} />
+        <Route path="/shared-routing" element={<SharedRoutingPage />} />
         <Route path="/ai-apps" element={<AiAppsPage />} />
         <Route path="/process-routing" element={<ProcessRoutingPage />} />
         <Route path="/subscriptions" element={<ResourceCenter subscriptionsOnly />} />

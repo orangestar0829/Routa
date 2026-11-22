@@ -128,6 +128,7 @@ pub fn reconcile_hidden_listeners(model: &mut Model) {
             exit: Some(eid),
             user_enabled: enabled,
             routing: None,
+            inherit_shared_rules: false,
             hidden: true,
         });
     }

@@ -39,6 +39,9 @@ use crate::netif::WindowsInterfaces;
 use crate::runtime::{ApiFor, LauncherFor, Runtime, RuntimeEvent};
 use crate::store::Store;
 
+/// Isolated PR test builds must not touch an existing RoutaProcSvc or updater.
+pub(crate) const IS_RULES_PREVIEW: bool = option_env!("ROUTA_SHARED_RULES_PREVIEW").is_some();
+
 /// The bundled mihomo: next to the exe in production (`mihomo.exe`), the
 /// binaries folder of the source tree in debug builds.
 fn sidecar_path() -> PathBuf {
@@ -138,6 +141,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::get_status,
             commands::save_listener,
             commands::save_proxy,
+            commands::save_shared_routing,
             commands::delete_listener,
             commands::save_exit,
             commands::delete_exit,
@@ -287,7 +291,7 @@ pub fn run() {
                 // ready update may be installed now, in which case Routa exits
                 // without starting the core or the procroute client (whose
                 // Attach would otherwise be displaced by settle_graceful).
-                if updater::install::startup_gate(&handle, &updater, autostarted).await {
+                if !IS_RULES_PREVIEW && updater::install::startup_gate(&handle, &updater, autostarted).await {
                     return;
                 }
                 if let Err(e) = desktop.initialize(&rt).await {
@@ -306,7 +310,9 @@ pub fn run() {
                 // Only now: before the first start the core reads as Stopped
                 // (no reason), which would push Block to every rule. Until
                 // then the service keeps its own "Routa absent" fallback.
-                procroute::client::spawn(rt.clone(), handle);
+                if !IS_RULES_PREVIEW {
+                    procroute::client::spawn(rt.clone(), handle);
+                }
                 if updater::is_nsis_install() {
                     updater.spawn_background();
                 }

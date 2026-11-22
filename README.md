@@ -46,6 +46,12 @@ System proxy affects applications that honor Windows proxy settings. For applica
 
 Stopping system proxy or TUN leaves the core and proxy ports available; manually configured clients and independently enabled process-routing rules may still use them.
 
+## Shared routing rules
+
+In Full mode, open **共享规则** (Shared rules) to edit, reorder, and toggle common rules or add the mainland-China direct preset. To use a remote mihomo rule set, register it first and then reference it from a `RULE-SET` rule. Routa fetches these sources directly, independently of proxy ports; prefer trusted HTTPS sources.
+
+Opt in separately for each listener in **代理** (Proxies). Routa checks **per-port rules → enabled shared rules → the port's existing fallback**, in that order. A Proxy action still uses the listener's own outbound. Existing listeners do not opt in automatically. Process-routing settings do not need to change.
+
 ## Process-routing component
 
 Process routing runs as the `RoutaProcSvc` Windows service, built on [ProxyBridge](https://github.com/InterceptSuite/ProxyBridge) and [WinDivert](https://github.com/basil00/WinDivert). The installer registers it with a UAC prompt; if you decline, enable it later in the app.
