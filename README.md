@@ -54,7 +54,7 @@ Two-hop-only profiles remain readable in the prior two-hop preview. Do not open 
 
 The first version supports TCP with eligible HTTP, SOCKS5, Shadowsocks without plugins, VMess, VLESS, and Trojan nodes. UDP, nested chains, Tailscale, and using chains as strategy-group members are not supported. A connection timeout never falls back to Direct. Only an explicit Direct rule, or an explicitly configured Direct policy for a rule whose target can no longer be resolved, uses that route.
 
-### DNS for ordinary proxy ports (off by default)
+### DNS diversion (off by default)
 
 Under **设置 → 网络与内核 → DNS 分流**, choose a fixed supported TCP node or ordered chain. The core sends unclassified target lookups through that exit to your trusted HTTPS resolver. Fresh queries fail when the exit, its bound interface, any hop, the resolver, or certificate verification fails: there is no automatic system or plaintext DNS fallback. Cached answers do not require a fresh query.
 
@@ -62,7 +62,15 @@ Under **设置 → 网络与内核 → DNS 分流**, choose a fixed supported TC
 - The core bootstraps locally resolved proxy-server names via an independent, directly reachable resolver. Later chain hops may resolve on the preceding proxy instead. Direct DNS and bootstrap use the default network path, not each traffic port's bound adapter.
 - Use literal-IP HTTPS endpoints, with certificates trusted for that IP. The direct and bootstrap roles also accept explicit UDP IP addresses/ports, which disclose their respective queries in plaintext. Trust the configured DoH operator, including its replies and redirects.
 
-This is **one resolver policy per core**, including fixed-direct ports, IP-based routing lookups, and auxiliary traffic when it actually uses the core. It does not change a port's traffic exit. Routa does not open a DNS listening port, take over system DNS, or add Fake-IP or WebRTC interception. Applications that resolve before connecting, browser DoH, independent subscription downloads, and names resolved by a remote proxy are outside its reach. Use a domain-forwarding client mode, such as SOCKS5 with remote DNS, when appropriate. TUN retains its separate, unchanged Fake-IP profile. A material DNS change restarts the core to retire old connections and caches.
+This is **one resolver policy per core**, including fixed-direct ports, IP-based routing lookups, and auxiliary traffic when it actually uses the core. It does not change a port's traffic exit. In ordinary proxy mode, DNS stays on real addresses (`redir-host`). HTTP proxies and domain-forwarding SOCKS5 clients usually hand the host name straight to the proxy and do not need a synthetic address. No DNS listener is opened.
+
+**Optional: TUN 使用 DNS 分流（Fake-IP）.** Saving this option never starts TUN. If you separately enter TUN, its existing DNS capture uses the policy above. Otherwise TUN retains its legacy Fake-IP/DNS settings. Neither the traffic exit, per-port routing nor WebRTC is changed by this option.
+
+- For ordinary DNS captured by TUN, an unfiltered A query gets a synthetic IPv4 address in `198.18.0.0/16`. Its connection must return to the same core to recover the name. Synthetic AAAA and HTTPS/SVCB answers are empty (no synthetic IPv6); exceptions can receive real A/AAAA answers.
+- Direct suffixes and optional `GEOSITE:cn` get real answers from direct DNS. Windows connectivity probes and the configured DNS/TUN exits’ physical server names are not synthesized. An application looking up such a server still follows the normal DNS policy, not an extra direct route. The core's own node bootstrap is separate.
+- Localhost and its subdomains resolve to loopback. Single-label names and `.local`, `.lan`, `.internal`, and `.home.arpa` are refused rather than disclosed upstream unless explicitly allowed. For a NAS on `home.arpa`, add that suffix and set **直连 DNS** to a trusted LAN resolver (also used for other direct exceptions). Multicast mDNS is separate.
+- A synthetic answer is not a connectivity test: a route known to be missing suppresses synthesis; a configured but unreachable proxy can still yield a fake IP. When real resolution is needed, it does not fall back to system DNS. A material change can restart the core, interrupt capture/connections and discard mappings; do not pin synthetic addresses, since an old address can be reassigned; resolve the name again. This is not an OS kill switch: app/browser DoH, remote resolution and queries outside active TUN capture (including restart gaps) are not protected by this profile.
+
 
 ## Shared routing rules
 

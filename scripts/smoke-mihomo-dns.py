@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Exercise Routa's ordinary-port DNS configuration against the pinned Linux core.
+"""Exercise Routa's DNS diversion and opt-in TUN Fake-IP against the pinned core.
 
 Usage: python3 scripts/smoke-mihomo-dns.py /path/to/mihomo
 Needs Linux user/mount/network namespaces (unshare) and OpenSSL. No network
 access, root on the host, external DNS, or modification to host resolv.conf.
 Pass --fixture-dir DIR to use the exact YAML exported by Routa's Rust test.
 Without fixtures, independently checks the corresponding pinned core behavior.
+For the Fake-IP test only, expose the same enhanced resolver on private
+loopback instead of creating an OS TUN adapter in the test namespace.
 """
 
 import argparse
@@ -13,6 +15,7 @@ import base64
 import contextlib
 import fcntl
 import http.server
+import ipaddress
 import json
 import os
 import pathlib
@@ -32,6 +35,7 @@ import urllib.parse
 import urllib.request
 
 IP = "127.0.0.1"
+DIRECT_IPV6 = "2001:db8::2"
 SYSTEM_IP = "127.0.0.2"
 ALIAS = "__routa_dns__"
 PIN = (pathlib.Path(__file__).resolve().parent.parent / "src-tauri/binaries/MIHOMO_VERSION").read_text().strip()
@@ -53,10 +57,14 @@ def parse_dns(packet):
 
 def response(packet, address):
     _, kind, question = parse_dns(packet)
-    count = 1 if kind == 1 and address is not None else 0
+    data = b""
+    if address is not None:
+        ip = ipaddress.ip_address(address)
+        if kind == (1 if ip.version == 4 else 28):
+            data = ip.packed
     rcode = 0 if address is not None else 3
-    header = packet[:2] + struct.pack("!5H", 0x8180 | rcode, 1, count, 0, 0)
-    answer = struct.pack("!HHHIH4s", 0xC00C, 1, 1, 30, 4, socket.inet_aton(address)) if count else b""
+    header = packet[:2] + struct.pack("!5H", 0x8180 | rcode, 1, bool(data), 0, 0)
+    answer = struct.pack("!HHHIH", 0xC00C, kind, 1, 30, len(data)) + data if data else b""
     return header + question + answer
 
 
@@ -65,7 +73,7 @@ class DnsUdp(socketserver.BaseRequestHandler):
         packet, server_socket = self.request
         name, kind, _ = parse_dns(packet)
         self.server.events.append((name, kind))
-        server_socket.sendto(response(packet, self.server.answer(name)), self.client_address)
+        server_socket.sendto(response(packet, self.server.answer(name, kind)), self.client_address)
 
 
 class DnsTcp(socketserver.StreamRequestHandler):
@@ -76,7 +84,7 @@ class DnsTcp(socketserver.StreamRequestHandler):
         packet = self.rfile.read(int.from_bytes(framing, "big"))
         name, kind, _ = parse_dns(packet)
         self.server.events.append((name, kind))
-        result = response(packet, self.server.answer(name))
+        result = response(packet, self.server.answer(name, kind))
         self.wfile.write(len(result).to_bytes(2, "big") + result)
 
 
@@ -227,7 +235,7 @@ def config(exit_port, entry_port, doh_port, direct_dns, bootstrap, controller, d
 
 
 @contextlib.contextmanager
-def running(core, root, cfg, controller, cert):
+def running(core, root, cfg, controller, cert, *, ready_proxy, dns_port=None):
     path = root / "config.yaml"
     path.write_text(json.dumps(cfg) if isinstance(cfg, dict) else cfg)
     output = root / "core.log"
@@ -240,14 +248,37 @@ def running(core, root, cfg, controller, cert):
         with subprocess.Popen([str(core), "-d", str(root), "-f", str(path)], stdout=log, stderr=log, env=env) as proc:
             try:
                 deadline = time.monotonic() + 5
+                ports = (controller, ready_proxy) + ((dns_port,) if dns_port is not None else ())
+                for port in ports:
+                    while True:
+                        try:
+                            with socket.create_connection((IP, port), timeout=0.2):
+                                break
+                        except OSError:
+                            if proc.poll() is not None or time.monotonic() >= deadline:
+                                raise RuntimeError(f"pinned core did not start on port {port}")
+                            time.sleep(0.05)
+                # TCP and UDP listeners are started by separate goroutines.
+                if dns_port is not None:
+                    started = f"DNS server(UDP) listening at: {IP}:{dns_port}"
+                    while started not in output.read_text():
+                        if proc.poll() is not None or time.monotonic() >= deadline:
+                            raise RuntimeError(f"pinned core did not bind UDP port {dns_port}")
+                        time.sleep(0.05)
+                # Mihomo starts listening before finishing provider setup and
+                # releasing the tunnel from suspended/inner-only operation.
+                # Check actual routing with a literal loopback IP (no DNS).
                 while True:
                     try:
-                        with socket.create_connection((IP, controller), timeout=0.2):
-                            break
+                        status = visit(ready_proxy, IP, controller, path="/version",
+                                       extra_header="Authorization: Bearer test\r\n", timeout=0.25)
                     except OSError:
-                        if proc.poll() is not None or time.monotonic() >= deadline:
-                            raise RuntimeError("pinned core did not start")
-                        time.sleep(0.05)
+                        status = b""
+                    if b" 200 " in status:
+                        break
+                    if proc.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("pinned core is not forwarding on the fixture's fixed direct port")
+                    time.sleep(0.05)
                 yield output
             except BaseException:
                 print(output.read_text(), file=sys.stderr)
@@ -270,10 +301,58 @@ def query(ctrl, name):
     return answer[0]["data"] if result["Status"] == 0 and answer else None
 
 
-def visit(listener, name, target):
-    with socket.create_connection((IP, listener), timeout=7) as sock:
-        sock.sendall(f"GET http://{name}:{target}/ HTTP/1.1\r\nHost: {name}:{target}\r\nConnection: close\r\n\r\n".encode("ascii"))
+def visit(listener, name, target, *, path="/", extra_header="", timeout=7):
+    with socket.create_connection((IP, listener), timeout=timeout) as sock:
+        sock.sendall(f"GET http://{name}:{target}{path} HTTP/1.1\r\nHost: {name}:{target}\r\n"
+                     f"{extra_header}Connection: close\r\n\r\n".encode("ascii"))
         with sock.makefile("rb") as reply:
+            return reply.readline()
+
+
+def dns_wire(port, name, kind=1, *, tcp=False):
+    # /dns/query bypasses the enhanced DNS middleware. Send a wire query to
+    # the same DNS service as TUN's hijack instead, over UDP or framed TCP.
+    qname = b"".join(bytes([len(label)]) + label.encode("ascii") for label in name.split(".")) + b"\0"
+    question = qname + struct.pack("!HH", kind, 1)
+    header = struct.pack("!6H", 0x9629, 0x0100, 1, 0, 0, 0)
+    packet = header + question
+    if tcp:
+        with socket.create_connection((IP, port), timeout=8) as sock:
+            sock.sendall(len(packet).to_bytes(2, "big") + packet)
+            with sock.makefile("rb") as reply:
+                length = int.from_bytes(reply.read(2), "big")
+                packet = reply.read(length)
+    else:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(8)
+            sock.connect((IP, port))
+            sock.sendall(packet)
+            packet = sock.recv(4096)
+    ident, flags, questions, answers, _, _ = struct.unpack_from("!6H", packet)
+    assert ident == 0x9629 and flags & 0x8000 and not flags & 0x0200 and questions == 1
+    assert packet[12:12 + len(question)] == question, (name, packet)
+    rcode = flags & 15
+    if not answers:
+        return rcode, None
+    assert answers == 1 and rcode == 0 and kind in (1, 28), (name, kind, packet)
+    offset = 12 + len(question)
+    assert packet[offset:offset + 2] == b"\xc0\x0c", (name, packet)
+    answer_kind, klass, _, length = struct.unpack_from("!HHIH", packet, offset + 2)
+    assert answer_kind == kind and klass == 1
+    family = socket.AF_INET if kind == 1 else socket.AF_INET6
+    return rcode, socket.inet_ntop(family, packet[offset + 12:offset + 12 + length])
+
+
+def visit_socks_fake(listener, fake_address, target):
+    # Supply only the synthetic address in the SOCKS CONNECT, with a numeric
+    # Host header. Mihomo must recover the name from its Fake-IP pool.
+    with socket.create_connection((IP, listener), timeout=8) as sock:
+        with sock.makefile("rb") as reply:
+            sock.sendall(b"\x05\x01\x00")
+            assert reply.read(2) == b"\x05\x00"
+            sock.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(fake_address) + target.to_bytes(2, "big"))
+            assert reply.read(10)[:4] == b"\x05\x00\x00\x01"
+            sock.sendall(f"GET / HTTP/1.1\r\nHost: {IP}:{target}\r\nConnection: close\r\n\r\n".encode("ascii"))
             return reply.readline()
 
 
@@ -289,6 +368,45 @@ def fixture_config(fixtures, name, ports):
     text, count = re.subn(r"(?m)^log-level: warning$", "log-level: debug", text)
     assert count == 1, "generated config must contain its default log-level"
     return text
+
+
+def fakeip_wire_config(cfg, listen_port, direct_dns):
+    address = f"{IP}:{listen_port}"
+    if isinstance(cfg, str):
+        # Do not change production DNS policy, transport routing, or pools.
+        # A test DNS port invokes the enhancer without touching the host's
+        # TUN interfaces or DNS settings.
+        dns = re.search(r"(?m)^dns:\n((?: .+\n)*)", cfg)
+        assert dns and not re.search(r"(?m)^  listen:", dns[1]), "unexpected production DNS listen"
+        cfg, count = re.subn(r"(?m)^tun:\n  enable: true$", "tun:\n  enable: false", cfg)
+        assert count == 1, "expected exported TUN profile"
+        cfg, count = re.subn(r"(?m)^dns:$", f"dns:\n  listen: {address}", cfg)
+        assert count == 1
+        return cfg
+    # Standalone pinned-core check when no Routa fixture directory was passed.
+    available = cfg["proxy-groups"][0]["proxies"] != ["REJECT"]
+    real_suffixes = ["localhost", "local", "lan", "internal", "home.arpa", "local.test"]
+    cfg["hosts"] = {"+.localhost": [IP, "::1"]}
+    cfg["dns"].update({
+        "listen": address,
+        "enhanced-mode": "fake-ip",
+        "ipv6": True,
+        "fake-ip-range": "198.18.0.1/16",
+        "fake-ip-filter-mode": "blacklist" if available else "whitelist",
+        "fake-ip-filter": (
+            ["+." + name for name in real_suffixes] + ["*", "geosite:cn", "www.msftconnecttest.com", "node.entry.test"]
+            if available else []
+        ),
+        "use-hosts": True,
+    })
+    cfg["dns"]["nameserver-policy"].update({
+        "geosite:cn": f"{IP}:{direct_dns}",
+        "+.trusted.lan": f"{IP}:{direct_dns}",
+        "printer": f"{IP}:{direct_dns}",
+        "*": "rcode://refused",
+        **{"+." + name: "rcode://refused" for name in ("local", "lan", "internal", "home.arpa")},
+    })
+    return cfg
 
 
 def prime_geosite(root):
@@ -310,12 +428,15 @@ def exercise(core, root, fixtures):
     entry_calls, exit_calls, target_calls = [], [], []
     bootstrap_ready = True
     with contextlib.ExitStack() as stack:
-        spawn(stack, DnsUdp, host=SYSTEM_IP, port=53, protocol=Udp, answer=lambda _: IP, events=system_queries)
-        spawn(stack, DnsTcp, host=SYSTEM_IP, port=53, answer=lambda _: IP, events=system_queries)
-        direct_dns = spawn(stack, DnsUdp, protocol=Udp, answer=lambda _: IP, events=plaintext)
+        spawn(stack, DnsUdp, host=SYSTEM_IP, port=53, protocol=Udp, answer=lambda *_: IP, events=system_queries)
+        spawn(stack, DnsTcp, host=SYSTEM_IP, port=53, answer=lambda *_: IP, events=system_queries)
+        direct_dns = spawn(
+            stack, DnsUdp, protocol=Udp, events=plaintext,
+            answer=lambda name, kind: DIRECT_IPV6 if name == "allowed.local.test" and kind == 28 else IP,
+        )
         bootstrap = spawn(
             stack, DnsUdp, protocol=Udp,
-            answer=lambda name: IP if bootstrap_ready and name == "node.entry.test" else None,
+            answer=lambda name, _: IP if bootstrap_ready and name == "node.entry.test" else None,
             events=bootstrap_queries,
         )
         target = spawn(stack, Target, events=target_calls)
@@ -333,7 +454,7 @@ def exercise(core, root, fixtures):
             for hop in [exit_hop, entry_hop]:
                 threading.Thread(target=hop.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
                 stack.callback(hop.shutdown)
-            ctrl, direct, routed = free_ports(3)
+            ctrl, direct, routed, fakeip_port = free_ports(4)
             base = (exit_port, entry, doh, direct_dns, bootstrap, ctrl, direct, routed)
             def choose(name, **kwargs):
                 if fixtures:
@@ -344,11 +465,11 @@ def exercise(core, root, fixtures):
                 return cfg
 
             # A deliberately unprotected positive control is never a generated config.
-            with running(core, root, config(*base, system_control=True), ctrl, cert):
+            with running(core, root, config(*base, system_control=True), ctrl, cert, ready_proxy=direct):
                 assert query(ctrl, "positive-control.external.test") == IP
                 assert ("positive-control.external.test", 1) in system_queries, system_queries
             system_queries.clear()
-            with running(core, root, choose("single"), ctrl, cert) as log:
+            with running(core, root, choose("single"), ctrl, cert, ready_proxy=direct) as log:
                 assert query(ctrl, "protected.external.test") == IP
                 assert ("protected.external.test", 1) in doh_queries, doh_queries
                 assert exit_calls == [f"{IP}:{doh}"], exit_calls
@@ -385,18 +506,18 @@ def exercise(core, root, fixtures):
             else:
                 for key in ("default-nameserver", "proxy-server-nameserver"):
                     secure["dns"][key] = [endpoint]
-            with running(core, root, secure, ctrl, cert):
+            with running(core, root, secure, ctrl, cert, ready_proxy=direct):
                 before = len(exit_calls)
                 assert query(ctrl, "secure-bootstrap.external.test") == IP
                 assert ("secure-bootstrap.external.test", 1) in doh_queries
                 assert {name for name, _ in tls_bootstrap_queries} == {"node.entry.test"}
                 assert exit_calls[before:] == [f"{IP}:{doh}"]
-            with running(core, root, choose("unavailable", alias="REJECT"), ctrl, cert) as log:
+            with running(core, root, choose("unavailable", alias="REJECT"), ctrl, cert, ready_proxy=direct) as log:
                 before, attempts = len(doh_queries), len(exit_calls)
                 assert query(ctrl, "missing-egress.external.test") is None
                 assert len(doh_queries) == before and len(exit_calls) == attempts
                 assert "[DNS] system dns update" not in log.read_text()
-            with running(core, root, choose("single"), ctrl, cert) as log:
+            with running(core, root, choose("single"), ctrl, cert, ready_proxy=direct) as log:
                 bootstrap_ready = False
                 before, attempts, queries = len(doh_queries), len(exit_calls), len(bootstrap_queries)
                 assert query(ctrl, "bootstrap-failed.external.test") is None
@@ -404,12 +525,12 @@ def exercise(core, root, fixtures):
                 assert len(doh_queries) == before and len(exit_calls) == attempts
                 assert "[DNS] system dns update" not in log.read_text()
                 bootstrap_ready = True
-            with running(core, root, choose("single"), ctrl, None) as log:
+            with running(core, root, choose("single"), ctrl, None, ready_proxy=direct) as log:
                 before, attempts = len(doh_queries), len(exit_calls)
                 assert query(ctrl, "tls-failed.external.test") is None
                 assert len(doh_queries) == before and len(exit_calls) > attempts
                 assert "certificate" in log.read_text()
-            with running(core, root, choose("chain", chain=True), ctrl, cert) as log:
+            with running(core, root, choose("chain", chain=True), ctrl, cert, ready_proxy=direct) as log:
                 before, last = len(entry_calls), len(exit_calls)
                 assert query(ctrl, "two-hop.external.test") == IP
                 assert entry_calls[before:] == [f"{IP}:{exit_port}"], entry_calls
@@ -419,18 +540,84 @@ def exercise(core, root, fixtures):
                 assert query(ctrl, "two-hop-failed.external.test") is None
                 assert len(doh_queries) == before and len(exit_calls) == last, (doh_queries, exit_calls)
                 assert "[DNS] system dns update" not in log.read_text()
-            with running(core, root, choose("geosite"), ctrl, cert) as log:
+            with running(core, root, choose("geosite"), ctrl, cert, ready_proxy=direct) as log:
                 assert query(ctrl, "sub.fixture-cn.test") == IP
                 assert ("sub.fixture-cn.test", 1) in plaintext, plaintext
                 assert query(ctrl, "unlisted.cn") == IP
                 assert ("unlisted.cn", 1) in doh_queries, doh_queries
                 assert "[DNS] system dns update" not in log.read_text()
+            exit_hop.available = True
+            def fakeip(name, **kwargs):
+                return fakeip_wire_config(choose(name, **kwargs), fakeip_port, direct_dns)
+
+            pool = ipaddress.ip_network("198.18.0.0/16")
+            fake_name = "fake-wire.external.test"
+            with running(core, root, fakeip("fakeip"), ctrl, cert, ready_proxy=direct,
+                         dns_port=fakeip_port) as log:
+                before = (len(doh_queries), len(plaintext), len(bootstrap_queries))
+                rcode, synthetic = dns_wire(fakeip_port, fake_name)
+                assert rcode == 0 and ipaddress.ip_address(synthetic) in pool, synthetic
+                assert dns_wire(fakeip_port, fake_name, tcp=True) == (0, synthetic)
+                assert dns_wire(fakeip_port, fake_name, 28) == (0, None)
+                for name in ("unlisted.cn", "notlocal.test", "sub.node.entry.test"):
+                    rcode, address = dns_wire(fakeip_port, name)
+                    assert rcode == 0 and ipaddress.ip_address(address) in pool, name
+                assert (len(doh_queries), len(plaintext), len(bootstrap_queries)) == before
+                target_count = len(target_calls)
+                assert b" 200 " in visit_socks_fake(direct, synthetic, target)
+                assert len(target_calls) == target_count + 1 and (fake_name, 1) in doh_queries
+                # The DoH outbound's own dial uses the distinct bootstrap resolver.
+                assert ("node.entry.test", 1) in bootstrap_queries[before[2]:]
+
+                for name in ("allowed.local.test", "sub.fixture-cn.test", "thing.trusted.lan", "printer"):
+                    assert dns_wire(fakeip_port, name) == (0, IP), name
+                    assert (name, 1) in plaintext[before[1]:], plaintext
+                assert dns_wire(fakeip_port, "allowed.local.test", 28, tcp=True) == (0, DIRECT_IPV6)
+                assert ("allowed.local.test", 28) in plaintext[before[1]:], plaintext
+                for name in ("www.msftconnecttest.com", "node.entry.test"):
+                    assert dns_wire(fakeip_port, name) == (0, IP), name
+                    assert (name, 1) in doh_queries, doh_queries
+                before = (len(doh_queries), len(exit_calls), len(bootstrap_queries), len(plaintext))
+                assert dns_wire(fakeip_port, "service.localhost") == (0, IP)
+                assert dns_wire(fakeip_port, "localhost", 28) == (0, "::1")
+                for name in ("router.lan", "nas", "router.home.arpa", "device.local", "private.internal"):
+                    assert dns_wire(fakeip_port, name) == (5, None), name
+                assert (len(doh_queries), len(exit_calls), len(bootstrap_queries), len(plaintext)) == before
+                assert dns_wire(fakeip_port, "fake-txt.external.test", 16, tcp=True) == (0, None)
+                assert ("fake-txt.external.test", 16) in doh_queries
+
+                exit_hop.available = False
+                before, attempts = len(doh_queries), len(exit_calls)
+                # A synthetically allocated address does not prove the upstream
+                # is reachable. A real lookup must fail, without DNS fallback.
+                rcode, synthetic = dns_wire(fakeip_port, "fake-dead-a.external.test")
+                assert rcode == 0 and ipaddress.ip_address(synthetic) in pool
+                assert len(doh_queries) == before and len(exit_calls) == attempts
+                assert dns_wire(fakeip_port, "fake-dead-txt.external.test", 16) == (2, None)
+                assert len(doh_queries) == before and len(exit_calls) > attempts
+                assert dns_wire(fakeip_port, "fake-dead.local.test") == (0, IP)
+                assert ("fake-dead.local.test", 1) in plaintext
+                assert "[DNS] system dns update" not in log.read_text()
+                exit_hop.available = True
+
+            with running(core, root, fakeip("fakeip-unavailable", alias="REJECT"), ctrl, cert,
+                         ready_proxy=direct, dns_port=fakeip_port) as log:
+                before = (len(doh_queries), len(exit_calls), len(bootstrap_queries), len(plaintext))
+                assert dns_wire(fakeip_port, "fake-missing-a.external.test") == (2, None)
+                assert dns_wire(fakeip_port, "fake-missing-txt.external.test", 16, tcp=True) == (2, None)
+                assert (len(doh_queries), len(exit_calls), len(bootstrap_queries), len(plaintext)) == before
+                assert "[DNS] system dns update" not in log.read_text()
+
             assert not system_queries, system_queries
             assert {name for name, _ in bootstrap_queries} == {"node.entry.test"}, bootstrap_queries
-            assert {name for name, _ in plaintext} == {"allowed.local.test", "failure-survival.local.test", "sub.fixture-cn.test"}, plaintext
+            assert {name for name, _ in plaintext} == {
+                "allowed.local.test", "failure-survival.local.test", "sub.fixture-cn.test", "fake-dead.local.test",
+                "thing.trusted.lan", "printer",
+            }, plaintext
     source = "Routa-exported YAML" if fixtures else "independent core config"
     print(f"{PIN} ({source}): named DoH, explicit suffix and GEOSITE policy, bootstrap, "
-          "direct/IP rules, two-hop, TLS failure and fail-closed passed; no system or plaintext fallback observed.")
+          "direct/IP rules, two-hop, TLS failure, Fake-IP wire DNS and SOCKS mapping passed; "
+          "no system or plaintext fallback observed.")
 
 
 def main():

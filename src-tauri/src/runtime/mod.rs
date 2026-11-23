@@ -65,7 +65,8 @@ pub enum SettingsSaveError {
 fn validate_dns_exit_change(old: &Model, new: &Model) -> Result<(), Vec<ValidationError>> {
     let previous = &old.settings.dns_protection;
     let current = &new.settings.dns_protection;
-    if !current.enabled || (previous.enabled && previous.proxy_exit == current.proxy_exit) {
+    let new_tun_policy = current.tun_fake_ip && !previous.tun_fake_ip;
+    if !current.enabled || (previous.enabled && previous.proxy_exit == current.proxy_exit && !new_tun_policy) {
         return Ok(());
     }
     let eligible = current.proxy_exit.as_ref().is_some_and(|id| {
@@ -186,7 +187,7 @@ struct Engine {
     /// Whether the supervisor restarts the core when it is not running.
     supervise: bool,
     tun_exit: Option<ExitId>,
-    /// A saved ordinary DNS change has not been loaded, including a disable
+    /// A saved active DNS change has not been loaded, including a disable
     /// whose attempted replacement core did not start.
     dns_settings_pending: bool,
     alloc: PortAllocator,
@@ -594,11 +595,15 @@ impl Inner {
             fetch_listeners: &fetch,
             nics: &nics,
         };
-        // While TUN is active the DNS diversion settings are suspended.
-        // Check the ordinary profile as well before persisting it.
+        // Validate both shapes when needed. -t only parses; it never opens a TUN.
         if eng.tun_exit.is_some() && m.settings.dns_protection.enabled {
             let ordinary = generate_for_capture(&input, None);
             self.check_generated(&m.settings, &ordinary).await?;
+        } else if eng.tun_exit.is_none() && m.settings.dns_protection.enabled && m.settings.dns_protection.tun_fake_ip {
+            // A future TUN exit has not been chosen yet. Check the DNS shape
+            // with an unavailable target (REJECT), without selecting a route.
+            let probe = generate_for_capture(&input, Some(&ExitId(String::new())));
+            self.check_generated(&m.settings, &probe).await?;
         }
         let generated = generate_for_capture(&input, eng.tun_exit.as_ref());
         self.check_generated(&m.settings, &generated).await
@@ -957,7 +962,7 @@ impl Inner {
             None => None,
         };
 
-        if tun_exit.is_none() && matches!(&outcome, Some(ApplyOutcome::Reloaded { .. })) {
+        if matches!(&outcome, Some(ApplyOutcome::Reloaded { .. })) {
             *dns_settings_pending = false;
         }
         if let Some(ApplyOutcome::FailedCoreStopped { .. }) = &outcome {
@@ -1360,15 +1365,24 @@ impl Runtime {
         let old_settings = &eng.model.settings;
         let core_changed = settings.controller_port != old_settings.controller_port
             || settings.core_path != old_settings.core_path;
-        let dns_was_protected = old_settings.dns_protection.enabled
+        let in_tun = eng.tun_exit.is_some();
+        let active = |p: &crate::model::DnsProtection| p.enabled && (!in_tun || p.tun_fake_ip);
+        let old_dns = &old_settings.dns_protection;
+        let new_dns = &settings.dns_protection;
+        let dns_was_protected = active(old_dns)
             || eng.core.as_ref().is_some_and(|run| run.applier.has_protected_dns());
-        let dns_changed = settings.dns_protection != old_settings.dns_protection
-            && (settings.dns_protection.enabled || old_settings.dns_protection.enabled);
-        let dns_retry = eng.dns_settings_pending || ((settings.dns_protection.enabled || dns_was_protected)
+        let dns_changed = new_dns != old_dns && (new_dns.enabled || old_dns.enabled);
+        // Arming/disarming the TUN option alone must not reload the ordinary
+        // process. Conversely an already-active TUN must apply a change now,
+        // including opting out and restoring its original DNS config.
+        let mut old_for_active_mode = old_dns.clone();
+        if !in_tun { old_for_active_mode.tun_fake_ip = new_dns.tun_fake_ip; }
+        let active_changed = (active(old_dns) || active(new_dns)) && &old_for_active_mode != new_dns;
+        let dns_retry = eng.dns_settings_pending || ((active(new_dns) || dns_was_protected)
             && matches!(&self.inner.status.lock().unwrap().last_apply,
                 Some(ApplyOutcome::FailedKeptPrevious { .. } | ApplyOutcome::FailedClosed { .. }
                     | ApplyOutcome::FailedCoreStopped { .. } | ApplyOutcome::NotRunning { .. })));
-        let apply_dns = eng.tun_exit.is_none() && (dns_changed || dns_retry);
+        let apply_dns = active_changed || dns_retry;
         let mut model = eng.model.clone();
         model.settings = settings;
         normalize(&mut model);
@@ -1558,12 +1572,20 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn tun_adapter_ready(&self) -> bool {
+    fn tun_adapter_is_up(&self, name: &str) -> bool {
         self.inner
             .nics
             .list()
             .iter()
-            .any(|n| n.is_up && (n.friendly_name == "RoutaTun" || n.mihomo_name == "RoutaTun"))
+            .any(|n| n.is_up && (n.friendly_name == name || n.mihomo_name == name))
+    }
+
+    pub fn tun_adapter_ready(&self) -> bool {
+        self.tun_adapter_is_up(crate::TUN_DEVICE_NAME)
+    }
+
+    pub fn stable_tun_adapter_ready(&self) -> bool {
+        self.tun_adapter_is_up("RoutaTun")
     }
 
     pub fn status(&self) -> RuntimeStatus {

@@ -41,6 +41,9 @@ use crate::store::Store;
 
 /// Isolated PR test builds must not touch an existing RoutaProcSvc or updater.
 pub(crate) const IS_RULES_PREVIEW: bool = option_env!("ROUTA_SHARED_RULES_PREVIEW").is_some();
+/// Only the dedicated DNS PR preview permits a manually requested TUN.
+pub(crate) const ALLOW_PREVIEW_TUN: bool = IS_RULES_PREVIEW && option_env!("ROUTA_TUN_PREVIEW").is_some();
+pub(crate) const TUN_DEVICE_NAME: &str = if ALLOW_PREVIEW_TUN { "RoutaPreviewTun" } else { "RoutaTun" };
 
 /// The bundled mihomo: next to the exe in production (`mihomo.exe`), the
 /// binaries folder of the source tree in debug builds.
@@ -318,11 +321,11 @@ pub fn run() {
                 }
                 desktop.clone().spawn_monitor(rt.clone());
                 let preferences = desktop.state(&rt).preferences;
-                if relaunch::connect_tun_requested() && desktop::is_admin() {
+                if !IS_RULES_PREVIEW && relaunch::connect_tun_requested() && desktop::is_admin() {
                     if let Err(e) = desktop.connect(&rt, Some(desktop::CaptureMode::Tun)).await {
                         eprintln!("connect TUN after relaunch: {e}");
                     }
-                } else if preferences.auto_connect {
+                } else if !IS_RULES_PREVIEW && preferences.auto_connect {
                     let result = if preferences.mode == Some(desktop::InterfaceMode::Full)
                         && preferences.capture_mode == desktop::CaptureMode::System
                     {

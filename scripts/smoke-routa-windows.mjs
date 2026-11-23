@@ -465,17 +465,24 @@ try {
   const toggle = '[role=dialog] input[role="switch"][aria-label="启用 DNS 分流"]';
   if ((await find(toggle)).checked) throw new Error("DNS protection was not off by default");
   await click(toggle);
+  const tunPreview = process.env.ROUTA_MANUAL_TUN_PREVIEW === "true";
+  const fakeIpToggle = '[role=dialog] input[role="switch"][aria-label="TUN 使用 DNS 分流（Fake-IP）"]';
+  if (tunPreview) {
+    if ((await find(fakeIpToggle)).checked) throw new Error("Protected TUN DNS was not off by default");
+    await click(fakeIpToggle);
+    if (!(await find(fakeIpToggle)).checked) throw new Error("Protected TUN DNS did not switch on");
+  }
   const dnsOutlet = "DNS 测试端口 · 测试出口 A";
   await chooseDialogOption("代理 DNS 出口", dnsOutlet);
   const directSuffix = "fixture.invalid";
   await fill("直连 DNS 后缀", directSuffix);
   await find('[role=dialog] button', "保存并应用");
-  await capture("10-dns-protection-editor");
+  await capture(tunPreview ? "10-tun-fakeip-editor" : "10-dns-protection-editor");
   await click('[role=dialog] button', "保存并应用");
   await wait("DNS editor closed", () => evaluate('!document.querySelector("[role=dialog]")'));
   await find(`${dnsSettings} .MuiChip-root`, "已配置");
   await find(`${dnsSettings} [role="alert"]`, "DNS 分流设置已保存");
-  await capture("11-dns-protection-enabled");
+  await capture(tunPreview ? "11-tun-fakeip-configured" : "11-dns-protection-enabled");
 
   report.stage = "verify saved DNS config can be reopened and disabled";
   await navigate("listeners");
@@ -483,6 +490,7 @@ try {
   await click('[role=tab]', "网络与内核");
   await click(`${dnsSettings} button`, "配置 DNS 分流");
   if (!(await find(toggle)).checked) throw new Error("Saved DNS protection is not enabled");
+  if (tunPreview && !(await find(fakeIpToggle)).checked) throw new Error("Protected TUN DNS setting did not persist");
   const outlet = await find('[role=dialog] [role=combobox]', "代理 DNS 出口");
   const suffix = await find('[role=dialog] label', "直连 DNS 后缀", { input: true });
   if (outlet.text !== dnsOutlet || suffix.value !== directSuffix) {

@@ -37,7 +37,7 @@ fn doh(s: &str) -> bool {
         || authority.parse::<SocketAddr>().is_ok_and(|a| a.port() > 0 && usable_ip(a.ip()) && !authority.contains('%'))
 }
 
-fn valid_suffix(s: &str) -> bool {
+pub(crate) fn valid_suffix(s: &str) -> bool {
     !s.is_empty() && s.len() <= 253 && s.parse::<IpAddr>().is_err() &&
         s.split('.').all(|label| !label.is_empty() && label.len() <= 63 &&
             !label.starts_with('-') && !label.ends_with('-') &&

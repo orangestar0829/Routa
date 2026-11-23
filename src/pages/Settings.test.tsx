@@ -8,7 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import type { ApplyOutcome, Model, RuntimeStatus } from "../bindings";
+import type { ApplyOutcome, DnsProtection, Model, RuntimeStatus } from "../bindings";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -48,6 +48,18 @@ const model: Model = {
   manual_nodes: [],
   node_groups: [],
   process_routing: { rules: [], exit_prompt: true },
+};
+const enabledDns: DnsProtection = {
+  enabled: true, proxy_exit: "e1", direct_dns: "223.5.5.5", proxy_doh: "https://1.1.1.1/dns-query",
+  bootstrap_dns: "https://223.5.5.5/dns-query", direct_suffixes: [], direct_geosite_cn: false, tun_fake_ip: false,
+};
+const fakeIpLabel = "TUN 使用 DNS 分流（Fake-IP）";
+const tunModel: Model = {
+  ...model,
+  settings: { ...model.settings, dns_protection: enabledDns },
+  manual_nodes: [{ id: "m1", name: "测试节点", groups: [],
+    kind: { Proxy: { raw: { type: "socks5", server: "127.0.0.1", port: 8080 } } } }],
+  exits: [{ id: "e1", name: "测试出口", kind: { Node: { node: { manual_id: "m1" } } }, interface: null }],
 };
 
 function renderPage(initial = model, simple = false, tab = "network") {
@@ -94,9 +106,15 @@ describe("Settings", () => {
     fireEvent.click(config);
     const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
     const toggle = within(dialog).getByRole("switch", { name: "启用 DNS 分流" });
+    const fakeIp = within(dialog).getByRole("switch", { name: fakeIpLabel });
     expect(toggle).not.toBeChecked();
+    expect(fakeIp).toBeDisabled();
+    expect(fakeIp).not.toBeChecked();
+    expect(fakeIp).toHaveAccessibleDescription("仅在开启 TUN 后生效，不会替你开启 TUN。");
     expect(within(dialog).getByLabelText("代理 DNS（DoH）")).toBeDisabled();
     fireEvent.click(toggle);
+    expect(fakeIp).toBeEnabled();
+    fireEvent.click(fakeIp);
     fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
     expect(within(dialog).getByText("请先为普通代理端口配置支持的节点或代理链")).toBeInTheDocument();
     expect(commands.saveSettings).not.toHaveBeenCalled();
@@ -104,6 +122,7 @@ describe("Settings", () => {
     await waitFor(() => expect(dialog).not.toBeInTheDocument());
     fireEvent.click(config);
     expect(screen.getByRole("switch", { name: "启用 DNS 分流" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: fakeIpLabel })).not.toBeChecked();
   });
 
   it("saves DNS protection atomically without submitting a control port draft", async () => {
@@ -145,7 +164,7 @@ describe("Settings", () => {
     expect(commands.saveSettings).toHaveBeenLastCalledWith({
       ...model.settings, dns_protection: {
         enabled: true, proxy_exit: "e1", direct_dns: "223.5.5.5", proxy_doh: "https://1.1.1.1/dns-query",
-        bootstrap_dns: "https://223.5.5.5/dns-query", direct_suffixes: ["cn", "example.com"], direct_geosite_cn: true,
+        bootstrap_dns: "https://223.5.5.5/dns-query", direct_suffixes: ["cn", "example.com"], direct_geosite_cn: true, tun_fake_ip: false,
       },
     });
     expect(screen.getByLabelText("控制端口")).toHaveValue(19130);
@@ -154,18 +173,131 @@ describe("Settings", () => {
 
   it.each([
     { core: "Stopped", last_apply: null },
+    { core: "Running", last_apply: null },
     { core: "Running", last_apply: { FailedKeptPrevious: { error: "旧进程未退出" } } },
   ])("does not mark DNS applied when the core state is $core but has no successful apply", async (state) => {
     vi.mocked(commands.getStatus).mockResolvedValueOnce({
       ...state, health: { exits: {}, listeners: {} },
     } as RuntimeStatus);
-    renderPage({ ...model, settings: { ...model.settings, dns_protection: {
-      enabled: true, proxy_exit: "e1", direct_dns: "223.5.5.5", proxy_doh: "https://1.1.1.1/dns-query",
-      bootstrap_dns: "https://223.5.5.5/dns-query", direct_suffixes: [], direct_geosite_cn: false,
-    } } });
+    renderPage({ ...model, settings: { ...model.settings, dns_protection: enabledDns } });
     const dns = await screen.findByRole("region", { name: "DNS" });
     expect(await within(dns).findByText("未应用")).toBeInTheDocument();
     expect(within(dns).queryByText("已配置")).not.toBeInTheDocument();
+  });
+
+  it("saves the opt-in for next time without entering TUN", async () => {
+    renderPage(tunModel);
+    fireEvent.click(await screen.findByRole("button", { name: "配置 DNS 分流" }));
+    const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+    fireEvent.click(within(dialog).getByRole("switch", { name: fakeIpLabel }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+    expect(await screen.findByText(/进入 TUN 后随之应用/)).toBeInTheDocument();
+    expect(commands.saveSettings).toHaveBeenLastCalledWith({
+      ...tunModel.settings, dns_protection: { ...enabledDns, tun_fake_ip: true },
+    });
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).not.toContain("set_desktop_connection");
+    expect(screen.queryByText("TUN · Fake-IP")).not.toBeInTheDocument();
+  });
+
+  describe("DNS while TUN is already connected", () => {
+    beforeEach(() => {
+      vi.mocked(invoke).mockImplementation(async (command) =>
+        command === "desktop_state" ? { connection: "Tun", preferences: {} } : undefined);
+      vi.mocked(commands.getStatus).mockResolvedValue({
+        core: "Running", health: { exits: {}, listeners: {} },
+        last_apply: { Reloaded: { cut: 0, uncut: 0, failed_listeners: [] } },
+      } as Partial<RuntimeStatus> as RuntimeStatus);
+    });
+    afterEach(() => {
+      vi.mocked(invoke).mockReset();
+      vi.mocked(commands.getStatus).mockReset();
+    });
+
+    it("applies the opt-in immediately, then lets the user return to the original TUN DNS", async () => {
+      renderPage(tunModel);
+      const dns = await screen.findByRole("region", { name: "DNS" });
+      expect(await within(dns).findByText("TUN 中暂停")).toBeInTheDocument();
+      const config = within(dns).getByRole("button", { name: "配置 DNS 分流" });
+      fireEvent.click(config);
+      const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+      expect(within(dialog).getByText("退出 TUN 后生效")).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole("switch", { name: fakeIpLabel }));
+      expect(within(dialog).getByText("应用变更可能中断现有连接")).toBeInTheDocument();
+      fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+      expect(await within(dns).findByText("TUN · Fake-IP")).toBeInTheDocument();
+      expect(commands.saveSettings).toHaveBeenLastCalledWith({
+        ...tunModel.settings, dns_protection: { ...enabledDns, tun_fake_ip: true },
+      });
+      await waitFor(() => expect(dialog).not.toBeInTheDocument());
+      fireEvent.click(config);
+      const reopened = screen.getByRole("dialog", { name: "DNS 分流" });
+      const fakeIp = within(reopened).getByRole("switch", { name: fakeIpLabel });
+      expect(fakeIp).toBeChecked();
+      fireEvent.click(fakeIp);
+      expect(within(reopened).getByText("应用变更可能中断现有连接")).toBeInTheDocument();
+      fireEvent.click(within(reopened).getByRole("button", { name: "保存并应用" }));
+      expect(await within(dns).findByText("TUN 中暂停")).toBeInTheDocument();
+      expect(commands.saveSettings).toHaveBeenLastCalledWith(tunModel.settings);
+      expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).not.toContain("set_desktop_connection");
+    });
+
+    it("reports an unsuccessful apply instead of claiming active Fake-IP", async () => {
+      renderPage(tunModel);
+      const dns = await screen.findByRole("region", { name: "DNS" });
+      await within(dns).findByText("TUN 中暂停");
+      vi.mocked(commands.saveSettings).mockResolvedValueOnce({
+        status: "ok", data: { FailedKeptPrevious: { error: "旧进程未退出" } },
+      });
+      fireEvent.click(within(dns).getByRole("button", { name: "配置 DNS 分流" }));
+      const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+      fireEvent.click(within(dialog).getByRole("switch", { name: fakeIpLabel }));
+      fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+      expect(await within(dns).findByText("未应用")).toBeInTheDocument();
+      expect(within(dns).getByRole("alert")).toHaveTextContent("已保存，但未生效，目前仍使用原配置");
+      expect(within(dns).queryByText("TUN · Fake-IP")).not.toBeInTheDocument();
+    });
+
+    it("can restore the original TUN DNS even when the previously selected node is gone", async () => {
+      renderPage({ ...tunModel, exits: [],
+        settings: { ...tunModel.settings, dns_protection: { ...enabledDns, tun_fake_ip: true } } });
+      const dns = await screen.findByRole("region", { name: "DNS" });
+      await within(dns).findByText("出口不可用");
+      fireEvent.click(within(dns).getByRole("button", { name: "配置 DNS 分流" }));
+      const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+      fireEvent.click(within(dialog).getByRole("switch", { name: fakeIpLabel }));
+      fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+      expect(await within(dns).findByText("TUN 中暂停")).toBeInTheDocument();
+      expect(commands.saveSettings).toHaveBeenLastCalledWith(tunModel.settings);
+    });
+
+    it.each([true, false])("does not claim a failed previous opt-out applied (DNS enabled: %s)", async (enabled) => {
+      vi.mocked(commands.getStatus).mockResolvedValue({
+        core: "Running", health: { exits: {}, listeners: {} },
+        last_apply: { FailedKeptPrevious: { error: "旧进程未退出" } },
+      } as Partial<RuntimeStatus> as RuntimeStatus);
+      const settings = { ...tunModel.settings, dns_protection: { ...enabledDns, enabled } };
+      renderPage({ ...tunModel, exits: [], settings });
+      const dns = await screen.findByRole("region", { name: "DNS" });
+      await within(dns).findByText("未应用");
+      expect(within(dns).queryByText("TUN 中暂停")).not.toBeInTheDocument();
+      expect(within(dns).queryByText("已关闭")).not.toBeInTheDocument();
+      fireEvent.click(within(dns).getByRole("button", { name: "配置 DNS 分流" }));
+      const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+      await waitFor(() => expect(commands.saveSettings).toHaveBeenLastCalledWith(settings));
+    });
+
+    it("does not claim TUN Fake-IP without a successful runtime status", async () => {
+      vi.mocked(commands.getStatus).mockReset().mockReturnValue(new Promise(() => {}));
+      renderPage({ ...tunModel,
+        settings: { ...tunModel.settings, dns_protection: { ...enabledDns, tun_fake_ip: true } } });
+      const dns = await screen.findByRole("region", { name: "DNS" });
+      fireEvent.click(within(dns).getByRole("button", { name: "配置 DNS 分流" }));
+      const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+      await within(dialog).findByText("保存后在当前 TUN 中应用 DNS 分流。");
+      fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+      expect(within(dns).queryByText("TUN · Fake-IP")).not.toBeInTheDocument();
+    });
   });
 
   it("keeps only core parameters as explicit drafts", async () => {

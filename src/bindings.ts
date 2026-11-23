@@ -724,7 +724,11 @@ error?: DelayError | null;
  * The measured path/test settings changed after this result was produced.
  */
 stale?: boolean }
-export type DnsProtection = { enabled: boolean; proxy_exit: ExitId | null; direct_dns: string; proxy_doh: string; bootstrap_dns: string; direct_suffixes: string[]; direct_geosite_cn: boolean }
+export type DnsProtection = { enabled: boolean; proxy_exit: ExitId | null; direct_dns: string; proxy_doh: string; bootstrap_dns: string; direct_suffixes: string[]; direct_geosite_cn: boolean;
+/**
+ * Reuse this policy with Fake-IP only when the user separately enters TUN.
+ */
+tun_fake_ip: boolean }
 export type DesktopState = { preferences: UiPreferences; connection: CaptureMode | null; requested: CaptureMode | null; error: string | null; is_admin: boolean; system_listener_id: ListenerId | null; taskbar_status_supported: boolean }
 export type Exit = { id: ExitId; name: string; kind: ExitKind; interface: InterfaceGuid | null; hidden?: boolean }
 export type ExitHealth = { status: ExitStatus; effective_members: NodeRef[]; missing_members: ExitMember[]; 
