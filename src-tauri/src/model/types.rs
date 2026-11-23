@@ -312,6 +312,37 @@ pub struct SharedRuleProvider {
     pub interval: u32,
 }
 
+/// Shared by the ordinary mihomo resolver, never inferred from per-port rules.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
+#[serde(default)]
+pub struct DnsProtection {
+    pub enabled: bool,
+    pub proxy_exit: Option<ExitId>,
+    pub direct_dns: String,
+    pub proxy_doh: String,
+    pub bootstrap_dns: String,
+    pub direct_suffixes: Vec<String>,
+    pub direct_geosite_cn: bool,
+}
+
+impl DnsProtection {
+    fn is_default(&self) -> bool { self == &Self::default() }
+}
+
+impl Default for DnsProtection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy_exit: None,
+            direct_dns: "223.5.5.5".into(),
+            proxy_doh: "https://1.1.1.1/dns-query".into(),
+            bootstrap_dns: "https://223.5.5.5/dns-query".into(),
+            direct_suffixes: vec![],
+            direct_geosite_cn: false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 #[serde(default)]
 pub struct Settings {
@@ -321,6 +352,9 @@ pub struct Settings {
     pub delay_test_interval_mins: Option<u32>,
     pub delay_test_url: String,
     pub node_monitor: NodeMonitorSettings,
+    #[serde(skip_serializing_if = "DnsProtection::is_default", default)]
+    #[specta(optional)]
+    pub dns_protection: DnsProtection,
 }
 
 impl Default for Settings {
@@ -332,6 +366,7 @@ impl Default for Settings {
             delay_test_interval_mins: Some(10),
             delay_test_url: "https://www.gstatic.com/generate_204".to_string(),
             node_monitor: NodeMonitorSettings::default(),
+            dns_protection: DnsProtection::default(),
         }
     }
 }
@@ -712,6 +747,13 @@ mod tests {
         }"#;
         let m: Model = serde_json::from_str(json).unwrap();
         assert_eq!(m.settings.delay_test_url, Settings::default().delay_test_url);
+        assert_eq!(m.settings.dns_protection, DnsProtection::default());
+        assert!(serde_json::to_value(&m.settings).unwrap().get("dns_protection").is_none());
+        // A disabled but customized profile survives toggling/round trips.
+        let mut settings = m.settings.clone();
+        settings.dns_protection.direct_suffixes.push("internal.example".into());
+        let back: Settings = serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(settings, back);
         assert_eq!((m.settings.autostart, m.settings.controller_port), (true, 19098));
         let s = &m.subscriptions[0];
         assert_eq!(s.fallback_exit, None);

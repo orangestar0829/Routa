@@ -446,6 +446,53 @@ try {
       .some((row) => row.innerText.includes("routa-fixture-chain.exe") &&
         row.innerText.includes(name) && row.innerText.includes("不可用时阻断"))
   ), chain)));
+  report.stage = "seed a fixed DNS outlet";
+  await navigate("listeners");
+  await click('button', "新增代理");
+  await fill("名称", "DNS 测试端口");
+  await click('[role=dialog] button', "统一转发");
+  await chooseNamedNode("节点", "测试出口 A");
+  await click('[role=dialog] button', "保存");
+  await wait("fixed DNS outlet saved", () => evaluate('!document.querySelector("[role=dialog]")'));
+  await text("DNS 测试端口");
+
+  report.stage = "open DNS settings, verify opt-in configuration";
+  await navigate("settings");
+  await click('[role=tab]', "网络与内核");
+  const dnsSettings = 'section[aria-label="DNS"]';
+  await find(`${dnsSettings} .MuiChip-root`, "已关闭");
+  await click(`${dnsSettings} button`, "配置 DNS 分流");
+  const toggle = '[role=dialog] input[role="switch"][aria-label="启用 DNS 分流"]';
+  if ((await find(toggle)).checked) throw new Error("DNS protection was not off by default");
+  await click(toggle);
+  const dnsOutlet = "DNS 测试端口 · 测试出口 A";
+  await chooseDialogOption("代理 DNS 出口", dnsOutlet);
+  const directSuffix = "fixture.invalid";
+  await fill("直连 DNS 后缀", directSuffix);
+  await find('[role=dialog] button', "保存并应用");
+  await capture("10-dns-protection-editor");
+  await click('[role=dialog] button', "保存并应用");
+  await wait("DNS editor closed", () => evaluate('!document.querySelector("[role=dialog]")'));
+  await find(`${dnsSettings} .MuiChip-root`, "已配置");
+  await find(`${dnsSettings} [role="alert"]`, "DNS 分流设置已保存");
+  await capture("11-dns-protection-enabled");
+
+  report.stage = "verify saved DNS config can be reopened and disabled";
+  await navigate("listeners");
+  await navigate("settings");
+  await click('[role=tab]', "网络与内核");
+  await click(`${dnsSettings} button`, "配置 DNS 分流");
+  if (!(await find(toggle)).checked) throw new Error("Saved DNS protection is not enabled");
+  const outlet = await find('[role=dialog] [role=combobox]', "代理 DNS 出口");
+  const suffix = await find('[role=dialog] label', "直连 DNS 后缀", { input: true });
+  if (outlet.text !== dnsOutlet || suffix.value !== directSuffix) {
+    throw new Error("Saved DNS config did not persist the selected outlet and suffix");
+  }
+  await click(toggle);
+  await click('[role=dialog] button', "保存并应用");
+  await wait("DNS editor closed after disabling", () => evaluate('!document.querySelector("[role=dialog]")'));
+  await find(`${dnsSettings} .MuiChip-root`, "已关闭");
+
   report.stage = "complete";
   report.status = "passed";
 } catch (error) {

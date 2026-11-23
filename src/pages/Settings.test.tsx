@@ -8,13 +8,14 @@ import {
   within,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import type { ApplyOutcome, Model } from "../bindings";
+import type { ApplyOutcome, Model, RuntimeStatus } from "../bindings";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 vi.mock("../bindings", () => ({
   commands: {
     getModel: vi.fn(),
+    getStatus: vi.fn(),
     saveSettings: vi.fn(),
     coreRestart: vi.fn(),
     openLogDir: vi.fn(),
@@ -85,6 +86,87 @@ async function showTab(name: string) {
 
 describe("Settings", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it("keeps DNS protection off by default and discards unsaved changes", async () => {
+    renderPage();
+    const config = await screen.findByRole("button", { name: "配置 DNS 分流" });
+    expect(within(screen.getByRole("region", { name: "DNS" })).getByText("已关闭")).toBeInTheDocument();
+    fireEvent.click(config);
+    const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+    const toggle = within(dialog).getByRole("switch", { name: "启用 DNS 分流" });
+    expect(toggle).not.toBeChecked();
+    expect(within(dialog).getByLabelText("代理 DNS（DoH）")).toBeDisabled();
+    fireEvent.click(toggle);
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+    expect(within(dialog).getByText("请先为普通代理端口配置支持的节点或代理链")).toBeInTheDocument();
+    expect(commands.saveSettings).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    fireEvent.click(config);
+    expect(screen.getByRole("switch", { name: "启用 DNS 分流" })).not.toBeChecked();
+  });
+
+  it("saves DNS protection atomically without submitting a control port draft", async () => {
+    renderPage({ ...model,
+      manual_nodes: [{ id: "m1", name: "测试节点", groups: [],
+        kind: { Proxy: { raw: { type: "socks5", server: "127.0.0.1", port: 8080 } } } }],
+      exits: [
+        { id: "direct", name: "直连出口", kind: "Direct", interface: null },
+        { id: "e1", name: "测试出口", kind: { Node: { node: { manual_id: "m1" } } }, interface: null },
+        { id: "hidden", name: "隐藏出口", hidden: true, kind: { Node: { node: { manual_id: "m1" } } }, interface: null },
+      ],
+    });
+    fireEvent.change(await screen.findByLabelText("控制端口"), { target: { value: "19130" } });
+    fireEvent.click(screen.getByRole("button", { name: "配置 DNS 分流" }));
+    const dialog = screen.getByRole("dialog", { name: "DNS 分流" });
+    fireEvent.click(within(dialog).getByRole("switch", { name: "启用 DNS 分流" }));
+    fireEvent.mouseDown(within(dialog).getByRole("combobox", { name: "代理 DNS 出口" }));
+    expect(screen.queryByRole("option", { name: "直连出口" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "隐藏出口" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("option", { name: "测试出口" }));
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: "中国大陆域名（GEOSITE:cn）" }));
+    fireEvent.change(within(dialog).getByLabelText("直连 DNS 后缀"), { target: { value: "cn\nexample.com,cn" } });
+    const doh = within(dialog).getByLabelText("代理 DNS（DoH）");
+    const presets = document.getElementById(doh.getAttribute("list")!) as HTMLDataListElement;
+    expect(Array.from(presets.options, ({ value }) => value)).toEqual([
+      "https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query",
+    ]);
+    fireEvent.change(doh, { target: { value: "https://dns.example/dns-query" } });
+    vi.mocked(commands.saveSettings).mockResolvedValueOnce({ status: "error",
+      error: [{ InvalidProxy: { name: "DNS 分流", reason: "代理 DoH 必须使用 IP 地址" } }],
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("代理 DoH 必须使用 IP 地址");
+    expect(doh).toHaveValue("https://dns.example/dns-query");
+    fireEvent.change(doh, { target: { value: "https://1.1.1.1/dns-query" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存并应用" }));
+    expect(await screen.findByText("DNS 分流设置已保存")).toBeInTheDocument();
+    expect(commands.saveSettings).toHaveBeenCalledTimes(2);
+    expect(commands.saveSettings).toHaveBeenLastCalledWith({
+      ...model.settings, dns_protection: {
+        enabled: true, proxy_exit: "e1", direct_dns: "223.5.5.5", proxy_doh: "https://1.1.1.1/dns-query",
+        bootstrap_dns: "https://223.5.5.5/dns-query", direct_suffixes: ["cn", "example.com"], direct_geosite_cn: true,
+      },
+    });
+    expect(screen.getByLabelText("控制端口")).toHaveValue(19130);
+    expect(commands.coreRestart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { core: "Stopped", last_apply: null },
+    { core: "Running", last_apply: { FailedKeptPrevious: { error: "旧进程未退出" } } },
+  ])("does not mark DNS applied when the core state is $core but has no successful apply", async (state) => {
+    vi.mocked(commands.getStatus).mockResolvedValueOnce({
+      ...state, health: { exits: {}, listeners: {} },
+    } as RuntimeStatus);
+    renderPage({ ...model, settings: { ...model.settings, dns_protection: {
+      enabled: true, proxy_exit: "e1", direct_dns: "223.5.5.5", proxy_doh: "https://1.1.1.1/dns-query",
+      bootstrap_dns: "https://223.5.5.5/dns-query", direct_suffixes: [], direct_geosite_cn: false,
+    } } });
+    const dns = await screen.findByRole("region", { name: "DNS" });
+    expect(await within(dns).findByText("未应用")).toBeInTheDocument();
+    expect(within(dns).queryByText("已配置")).not.toBeInTheDocument();
+  });
 
   it("keeps only core parameters as explicit drafts", async () => {
     renderPage();

@@ -2,6 +2,10 @@
 //! Everything is built as `serde_yaml_ng` values (never string concatenation)
 //! so any name round-trips; key order is fixed so output is byte-stable.
 
+mod dns;
+#[cfg(test)]
+mod dns_fixtures;
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -82,6 +86,8 @@ pub struct GenInput<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generated {
     pub yaml: String,
+    /// Material DNS policy and actual egress, used to retire old transports and caches.
+    pub protected_dns_fingerprint: Option<u64>,
     pub plan: EffectivePlan,
     /// (group name, member copy name) for each Ok select group whose selection is effective.
     pub selects: Vec<(String, String)>,
@@ -569,6 +575,10 @@ pub fn nodes_check_config(controller_port: u16, secret: &str, sub: &Subscription
 }
 
 pub fn generate(input: &GenInput) -> Generated {
+    generate_base(input, true)
+}
+
+fn generate_base(input: &GenInput, ordinary: bool) -> Generated {
     let model = input.model;
 
     // Every subscription node, for the node page's delay tests.
@@ -863,7 +873,10 @@ pub fn generate(input: &GenInput) -> Generated {
             (s(name), provider_config[name].clone())
         }).collect());
     }
+    let protected_dns_fingerprint = (ordinary && model.settings.dns_protection.enabled)
+        .then(|| dns::install(&mut root, model, &fingerprints));
     Generated {
+        protected_dns_fingerprint,
         yaml: serde_yaml_ng::to_string(&root).expect("routing config"),
         plan: EffectivePlan { listeners: plan },
         selects,
@@ -873,7 +886,7 @@ pub fn generate(input: &GenInput) -> Generated {
 /// TUN has its own explicit exit. User listeners keep their per-listener proxy.
 /// An invalid exit is rejected rather than falling back to DIRECT.
 pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
-    let mut generated = generate(input);
+    let mut generated = generate_base(input, tun_exit.is_none());
     let Some(id) = tun_exit else { return generated };
     let mut root: Value = serde_yaml_ng::from_str(&generated.yaml).expect("generated yaml");
     let selected = input

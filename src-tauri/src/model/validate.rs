@@ -523,6 +523,10 @@ fn validate_routing(model: &Model, errors: &mut Vec<ValidationError>) {
 pub fn validate(model: &Model) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     validate_routing(model, &mut errors);
+    if let Some(reason) = model.settings.dns_protection.problem() {
+        errors.push(ValidationError::InvalidProxy { name: "DNS 分流".into(), reason: reason.into() });
+    }
+
 
     check_unique("subscription", model.subscriptions.iter().map(|s| s.name.as_str()), &mut errors);
     check_unique("exit", model.exits.iter().map(|e| e.name.as_str()), &mut errors);
@@ -544,7 +548,7 @@ pub fn validate(model: &Model) -> Result<(), Vec<ValidationError>> {
     }
     // Hidden listeners/exits are generated with reserved `__proc` names.
     for e in &model.exits {
-        if !e.hidden {
+        if !e.hidden || e.name == super::dns::DNS_EGRESS_ALIAS {
             check_name(&e.name, true, &mut errors);
         }
         const BUILTIN: [&str; 6] = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"];

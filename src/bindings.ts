@@ -724,6 +724,7 @@ error?: DelayError | null;
  * The measured path/test settings changed after this result was produced.
  */
 stale?: boolean }
+export type DnsProtection = { enabled: boolean; proxy_exit: ExitId | null; direct_dns: string; proxy_doh: string; bootstrap_dns: string; direct_suffixes: string[]; direct_geosite_cn: boolean }
 export type DesktopState = { preferences: UiPreferences; connection: CaptureMode | null; requested: CaptureMode | null; error: string | null; is_admin: boolean; system_listener_id: ListenerId | null; taskbar_status_supported: boolean }
 export type Exit = { id: ExitId; name: string; kind: ExitKind; interface: InterfaceGuid | null; hidden?: boolean }
 export type ExitHealth = { status: ExitStatus; effective_members: NodeRef[]; missing_members: ExitMember[]; 
@@ -1017,7 +1018,7 @@ core_recovering: boolean;
  * Node monitor snapshot (targets, round timing, network verdict).
  */
 monitor: MonitorStatus }
-export type Settings = { autostart: boolean; core_path: string | null; controller_port: number; delay_test_interval_mins: number | null; delay_test_url: string; node_monitor: NodeMonitorSettings }
+export type Settings = { autostart: boolean; core_path: string | null; controller_port: number; delay_test_interval_mins: number | null; delay_test_url: string; node_monitor: NodeMonitorSettings; dns_protection?: DnsProtection }
 export type SettingsSaveError = ValidationError[] | string
 export type Subscription = { id: SubscriptionId; name: string; url: string; update_interval_mins: number | null; fallback_exit: ExitId | null; fallback_listener?: ListenerId | null; 
 /**

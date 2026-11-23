@@ -54,6 +54,16 @@ Two-hop-only profiles remain readable in the prior two-hop preview. Do not open 
 
 The first version supports TCP with eligible HTTP, SOCKS5, Shadowsocks without plugins, VMess, VLESS, and Trojan nodes. UDP, nested chains, Tailscale, and using chains as strategy-group members are not supported. A connection timeout never falls back to Direct. Only an explicit Direct rule, or an explicitly configured Direct policy for a rule whose target can no longer be resolved, uses that route.
 
+### DNS for ordinary proxy ports (off by default)
+
+Under **设置 → 网络与内核 → DNS 分流**, choose a fixed supported TCP node or ordered chain. The core sends unclassified target lookups through that exit to your trusted HTTPS resolver. Fresh queries fail when the exit, its bound interface, any hop, the resolver, or certificate verification fails: there is no automatic system or plaintext DNS fallback. Cached answers do not require a fresh query.
+
+- Explicit domain suffixes and optional `GEOSITE:cn` use the separate direct DNS upstream. GeoSite needs local data (first use may download it). A traffic-routing `GEOIP,CN` decision needs an IP and cannot classify a DNS query before the answer.
+- The core bootstraps locally resolved proxy-server names via an independent, directly reachable resolver. Later chain hops may resolve on the preceding proxy instead. Direct DNS and bootstrap use the default network path, not each traffic port's bound adapter.
+- Use literal-IP HTTPS endpoints, with certificates trusted for that IP. The direct and bootstrap roles also accept explicit UDP IP addresses/ports, which disclose their respective queries in plaintext. Trust the configured DoH operator, including its replies and redirects.
+
+This is **one resolver policy per core**, including fixed-direct ports, IP-based routing lookups, and auxiliary traffic when it actually uses the core. It does not change a port's traffic exit. Routa does not open a DNS listening port, take over system DNS, or add Fake-IP or WebRTC interception. Applications that resolve before connecting, browser DoH, independent subscription downloads, and names resolved by a remote proxy are outside its reach. Use a domain-forwarding client mode, such as SOCKS5 with remote DNS, when appropriate. TUN retains its separate, unchanged Fake-IP profile. A material DNS change restarts the core to retire old connections and caches.
+
 ## Shared routing rules
 
 In Full mode, open **共享规则** (Shared rules) to edit, reorder, and toggle common rules or add the mainland-China direct preset. To use a remote mihomo rule set, register it first and then reference it from a `RULE-SET` rule. Routa fetches these sources directly, independently of proxy ports; prefer trusted HTTPS sources.
