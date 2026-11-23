@@ -829,8 +829,9 @@ pub async fn get_connection_details(rt: Rt<'_>) -> Result<Vec<crate::runtime::Co
 }
 #[tauri::command]
 #[specta::specta]
-pub async fn read_core_log(rt: Rt<'_>) -> Result<String, String> {
-    read_log_tail(&rt.core_workdir().join("mihomo.log"), 64 * 1024)
+pub async fn read_core_log(rt: Rt<'_>) -> Result<crate::runtime::CoreLogSnapshot, String> {
+    let text = read_log_tail(&rt.core_workdir().join("mihomo.log"), 64 * 1024)?;
+    Ok(rt.core_log_snapshot(text))
 }
 
 fn read_log_tail(path: &std::path::Path, max_bytes: u64) -> Result<String, String> {

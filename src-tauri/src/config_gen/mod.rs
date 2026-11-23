@@ -3,6 +3,8 @@
 //! so any name round-trips; key order is fixed so output is byte-stable.
 
 mod dns;
+mod route_names;
+pub(crate) use route_names::{RouteName, RouteNames};
 #[cfg(test)]
 mod dns_fixtures;
 
@@ -89,6 +91,7 @@ pub struct Generated {
     /// Material DNS policy and actual egress, used to retire old transports and caches.
     pub protected_dns_fingerprint: Option<u64>,
     pub plan: EffectivePlan,
+    pub(crate) route_names: RouteNames,
     /// (group name, member copy name) for each Ok select group whose selection is effective.
     pub selects: Vec<(String, String)>,
 }
@@ -369,23 +372,27 @@ struct ExitParts {
     proxies: Vec<Value>,
     group: Option<Value>,
     shared: Vec<Value>,
+    route_names: RouteNames,
 }
 
 /// `None` when nothing could be emitted for the exit (treated as not Ok).
 fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface], scope: ChainScope<'_>) -> Option<ExitParts> {
     let iface = h.interface.as_ref().map(|n| n.mihomo_name.as_str());
-    let parts = match &exit.kind {
+    let mut route_names = RouteNames::default();
+    let (proxies, group, shared) = match &exit.kind {
         ExitKind::Node { .. } => match h.effective_members.first().and_then(|r| resolve(model, r)) {
-            Some(Resolved::Copyable { raw, manual, .. }) => ExitParts {
-                proxies: resolved_copy(raw, manual, &exit.name, iface).into_iter().collect(),
-                group: None,
-                shared: vec![],
-            },
-            Some(Resolved::Chain { node, hops }) => ExitParts {
-                proxies: chain_proxies(node, &hops, &exit.name, scope, iface)?,
-                group: None,
-                shared: vec![],
-            },
+            Some(Resolved::Copyable { raw, manual, .. }) => {
+                let proxy = resolved_copy(raw, manual, &exit.name, iface)?;
+                if let Some(label) = h.effective_members.first().and_then(|r| route_names::node_name(model, r)) {
+                    route_names.node(&exit.name, label);
+                }
+                (vec![proxy], None, vec![])
+            }
+            Some(Resolved::Chain { node, hops }) => {
+                let proxies = chain_proxies(node, &hops, &exit.name, scope, iface)?;
+                route_names.chain(&proxies, &node.name, &hops);
+                (proxies, None, vec![])
+            }
             Some(Resolved::Tailscale { node, opts }) => {
                 let def = tailscale_def(node, opts, nics)?;
                 let group = map(vec![
@@ -393,11 +400,8 @@ fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface],
                     ("type", s("select")),
                     ("proxies", Value::Sequence(vec![s(&manual_proxy_name(node))])),
                 ]);
-                ExitParts {
-                    proxies: vec![],
-                    group: Some(group),
-                    shared: vec![def],
-                }
+                route_names.node(&exit.name, &node.name);
+                (vec![], Some(group), vec![def])
             }
             None => return None,
         },
@@ -412,6 +416,9 @@ fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface],
                         if let Some(p) = resolved_copy(raw, manual, &name, iface) {
                             proxies.push(p);
                             names.push(s(&name));
+                            if let Some(label) = route_names::node_name(model, r) {
+                                route_names.node(&name, label);
+                            }
                         }
                     }
                     Some(Resolved::Tailscale { node, opts }) => {
@@ -432,25 +439,32 @@ fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface],
                 ("url", s(&model.settings.delay_test_url)),
                 ("interval", Value::from(interval)),
             ]);
-            ExitParts {
-                proxies,
-                group: Some(group),
-                shared,
+            if !matches!(scope, ChainScope::Rule(_)) {
+                let mut owners = model.visible_listeners().filter(|l| l.exit.as_ref() == Some(&exit.id));
+                let owner = owners.next();
+                let label = if let (Some(owner), None) = (owner, owners.next()) {
+                    format!("{} · 策略组", owner.name)
+                } else if exit.name.starts_with("__")
+                    || exit.name.strip_prefix("代理-").is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                {
+                    "策略组".into()
+                } else {
+                    format!("{} · 策略组", exit.name)
+                };
+                route_names.route(&exit.name, label);
             }
+            (proxies, Some(group), shared)
         }
         ExitKind::Direct => {
             let mut entries = vec![("name", s(&exit.name)), ("type", s("direct"))];
             if let Some(i) = iface {
                 entries.push(("interface-name", s(i)));
             }
-            ExitParts {
-                proxies: vec![map(entries)],
-                group: None,
-                shared: vec![],
-            }
+            route_names.terminal(&exit.name, "直连");
+            (vec![map(entries)], None, vec![])
         }
     };
-    (!parts.proxies.is_empty() || !parts.shared.is_empty()).then_some(parts)
+    (!proxies.is_empty() || !shared.is_empty()).then_some(ExitParts { proxies, group, shared, route_names })
 }
 
 /// A rule target gets its own name and copies of its proxies for each port,
@@ -479,7 +493,15 @@ fn rule_target_parts(input: &GenInput<'_>, port_exit: &Exit, alias: &str, target
         Some(Resolved::Tailscale { opts, .. }) => opts.interface == port_exit.interface,
         _ => true,
     });
-    exit_parts(input.model, &exit, &health, input.nics, ChainScope::Rule(alias))
+    let mut parts = exit_parts(input.model, &exit, &health, input.nics, ChainScope::Rule(alias))?;
+    if let ExitMember::Group { group } = target {
+        let label = match group {
+            GroupRef::Custom(id) => input.model.node_groups.iter().find(|g| &g.id == id).map(|g| g.name.as_str()),
+            GroupRef::Subscription(id) => input.model.subscriptions.iter().find(|s| &s.id == id).map(|s| s.name.as_str()),
+        };
+        parts.route_names.route(alias, label.map_or_else(|| "节点组".into(), |name| format!("{name} · 节点组")));
+    }
+    Some(parts)
 }
 
 fn hash_yaml(v: &Value) -> u64 {
@@ -580,20 +602,33 @@ pub fn generate(input: &GenInput) -> Generated {
 
 fn generate_base(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
     let model = input.model;
+    let mut route_names = RouteNames::builtins();
 
     // Every subscription node, for the node page's delay tests.
-    let mut proxies: Vec<Value> = model
-        .subscriptions
-        .iter()
-        .flat_map(|sub| {
-            sub.nodes
-                .iter()
-                .filter_map(move |n| proxy_copy(&n.raw, &node_proxy_name(sub, n), None))
-        })
-        .collect();
+    let mut proxies = Vec::new();
+    for sub in &model.subscriptions {
+        for node in &sub.nodes {
+            let id = node_proxy_name(sub, node);
+            if let Some(proxy) = proxy_copy(&node.raw, &id, None) {
+                route_names.node(&id, &node.name);
+                proxies.push(proxy);
+            }
+        }
+    }
     // Base copies for measurement. Each Tailscale instance is emitted once;
     // each chain emits its entire ordered set of physical hops.
-    proxies.extend(model.manual_nodes.iter().flat_map(|n| manual_node_parts(model, n, input.nics)));
+    for node in &model.manual_nodes {
+        let parts = manual_node_parts(model, node, input.nics);
+        if !parts.is_empty() {
+            let r = NodeRef::Manual { manual_id: node.id.clone() };
+            if let Some(Resolved::Chain { hops, .. }) = resolve(model, &r) {
+                route_names.chain(&parts, &node.name, &hops);
+            } else {
+                route_names.node(&manual_proxy_name(node), &node.name);
+            }
+            proxies.extend(parts);
+        }
+    }
 
     let mut groups = Vec::new();
     let mut selects = Vec::new();
@@ -610,6 +645,7 @@ fn generate_base(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
             continue;
         };
         fingerprints.insert(&exit.id, fingerprint(&parts));
+        route_names.merge(parts.route_names);
         proxies.extend(parts.proxies);
         groups.extend(parts.group);
 
@@ -678,6 +714,8 @@ fn generate_base(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
             let target_alias = format!("__target_{}", l.id.0);
             groups.push(map(vec![("name", s(&target_alias)), ("type", s("select")), ("proxies", Value::Sequence(vec![s(&exit.name)]))]));
             let direct_alias = format!("__direct_{}", l.id.0);
+            route_names.alias(&target_alias, &exit.name);
+            route_names.terminal(&direct_alias, "直连");
             let mut direct = vec![("name", s(&direct_alias)), ("type", s("direct"))];
             if let Some(nic) = input.health.exits.get(&exit.id).and_then(|h| h.interface.as_ref()) { direct.push(("interface-name", s(&nic.mihomo_name))); }
             proxies.push(map(direct));
@@ -721,6 +759,7 @@ fn generate_base(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
                         route_is_chain = matches!(target, ExitMember::Node(node) if is_chain_ref(model, node));
                         has_chain_target |= route_is_chain;
                         effective_targets.insert(s(&route_alias), Value::from(fingerprint(&parts)));
+                        route_names.merge(parts.route_names);
                         proxies.extend(parts.proxies);
                         groups.extend(parts.group);
                         guard_unsupported_transport = true;
@@ -876,7 +915,11 @@ fn generate_base(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
     let dns = &model.settings.dns_protection;
     let protected_dns_fingerprint = (dns.enabled && (tun_exit.is_none() || dns.tun_fake_ip))
         .then(|| dns::install(&mut root, input, &fingerprints, tun_exit));
+    if protected_dns_fingerprint.is_some() {
+        route_names.route(crate::model::dns::DNS_EGRESS_ALIAS, "代理 DNS");
+    }
     Generated {
+        route_names,
         protected_dns_fingerprint,
         yaml: serde_yaml_ng::to_string(&root).expect("routing config"),
         plan: EffectivePlan { listeners: plan },
@@ -903,6 +946,7 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
                 .is_some_and(|h| h.status == ExitStatus::Ok)
         });
     let target = selected.map(|e| e.name.as_str()).unwrap_or("REJECT");
+    generated.route_names.alias("__routa_tun__", target);
     // A reserved alias keeps user names (including commas) out of the rule grammar.
     root["proxy-groups"]
         .as_sequence_mut()
@@ -1829,7 +1873,20 @@ mod tests {
                     assert!(name.starts_with("__chain_hop"));
                     assert!(private_names.insert(name.to_owned()), "scope collision: {name}");
                 }
-                let expected = resolve_chain_hop(&m, &hops[i]).unwrap().raw;
+                let expected_hop = resolve_chain_hop(&m, &hops[i]).unwrap();
+                let route_id = p["name"].as_str().unwrap();
+                let Some(RouteName::Node { name, path }) = generated.route_names.get(route_id) else {
+                    panic!("missing exact display metadata for {route_id}")
+                };
+                assert_eq!(name, expected_hop.name);
+                if i + 1 == MAX_CHAIN_HOPS {
+                    let expected_path = hops.iter().map(|hop| resolve_chain_hop(&m, hop).unwrap().name)
+                        .collect::<Vec<_>>().join(" → ");
+                    assert_eq!(path.as_deref(), Some(format!("两跳 · 代理链：{expected_path}").as_str()));
+                } else {
+                    assert!(path.is_none());
+                }
+                let expected = expected_hop.raw;
                 assert_eq!(p["server"].as_str(), expected["server"].as_str());
                 assert_eq!(p["port"].as_u64(), expected["port"].as_u64());
                 assert_eq!(p["interface-name"].as_str(), if i == 0 { nic } else { None });

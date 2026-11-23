@@ -30,7 +30,9 @@ function TrafficCells({ traffic, stale }: {
 
 function PathCell({ row }: { row: LiveConnection }) {
   return <TableCell sx={{ overflowWrap: "anywhere" }}>
-    <Typography component="div" sx={{ fontSize: 12 }}>{row.node || "节点未确认"}</Typography>
+    <Typography component="div" sx={{ fontSize: 12 }} title={row.route ?? undefined}>
+      {row.node || row.route || "节点未确认"}
+    </Typography>
     <Typography component="div" variant="caption" color="text.secondary" sx={{ fontSize: 11 }}>
       {row.listener || "—"}
     </Typography>

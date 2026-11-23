@@ -416,6 +416,7 @@ mod tests {
             plan,
             selects: vec![],
             protected_dns_fingerprint: None,
+            route_names: Default::default(),
         }
     }
 

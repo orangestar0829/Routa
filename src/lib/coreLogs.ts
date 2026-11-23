@@ -1,5 +1,6 @@
 export type LogLevel = "error" | "warning" | "info" | "debug" | "unknown";
 export type LogFilter = "all" | "problems" | LogLevel;
+export type LogRouteLabels = Readonly<Partial<Record<string, string>>>;
 
 export interface CoreLogEntry {
   id: string;
@@ -73,11 +74,77 @@ function parseLine(raw: string): Omit<CoreLogEntry, "id"> {
   return { timestamp: "", level: "unknown", message: clean, raw };
 }
 
+/**
+ * Mihomo 1.19 logs a failed dial's selected route and a successful dial's
+ * resolved leaf (sometimes as `group[leaf]`). Replace only that field;
+ * node names may contain spaces, slashes or brackets. Diagnostic text and
+ * raw records must survive byte-for-byte.
+ */
+function labelRoutes(message: string, routes: ReadonlyMap<string, string>, leaves: ReadonlyMap<string, string>): string {
+  const firstLineEnd = message.indexOf("\n");
+  const firstLine = firstLineEnd < 0 ? message : message.slice(0, firstLineEnd);
+  const rest = firstLineEnd < 0 ? "" : message.slice(firstLineEnd);
+  const failure = firstLine.match(/^\[(?:TCP|UDP)\] dial /)?.[0];
+  if (failure) {
+    const afterPrefix = firstLine.slice(failure.length);
+    // SourceDetail() is mihomo for internal traffic, otherwise IP:port
+    // (possibly bracketed IPv6), with optional (process, uid=...) detail.
+    const dialTail = /^ (?:\(match .*?\) )?(?:mihomo|(?:[\d.]+|\[[^\]]+\]):\d+(?:\(.*?\))?) --> \S+ error: /;
+    let match: { end: number; label: string } | undefined;
+    const boundary = afterPrefix.indexOf(" --> ");
+    for (let end = afterPrefix.indexOf(" "); end >= 0 && end < boundary; end = afterPrefix.indexOf(" ", end + 1)) {
+      const label = routes.get(afterPrefix.slice(0, end));
+      if (!label || !dialTail.test(afterPrefix.slice(end))) continue;
+      if (match) return message;
+      match = { end, label };
+    }
+    if (match) return failure + match.label + afterPrefix.slice(match.end) + rest;
+    return message;
+  }
+
+  const forwarded = firstLine.match(/^\[(?:TCP|UDP)\] (?:mihomo|(?:[\d.]+|\[[^\]]+\]):\d+(?:\(.*?\))?) --> \S+:\d+(?= )/)?.[0];
+  if (!forwarded) return message;
+  const matches: { offset: number; label: string }[] = [];
+  for (let offset = firstLine.indexOf(" using ", forwarded.length);
+    offset >= 0; offset = firstLine.indexOf(" using ", offset + 7)) {
+    const qualifier = firstLine.slice(forwarded.length, offset);
+    if (qualifier && !qualifier.startsWith(" match ") && qualifier !== " doesn't match any rule") continue;
+    const start = offset + " using ".length;
+    const route = firstLine.slice(start);
+    const whole = leaves.get(route) ?? routes.get(route);
+    if (whole) matches.push({ offset: start, label: whole });
+    // Try exact split positions rather than assuming the first '[' belongs to
+    // the group or the last one to the leaf. Both sides must resolve.
+    if (route.endsWith("]")) {
+      for (let bracket = route.indexOf("["); bracket >= 0; bracket = route.indexOf("[", bracket + 1)) {
+        if (!routes.has(route.slice(0, bracket))) continue;
+        const leaf = leaves.get(route.slice(bracket + 1, -1));
+        if (leaf) matches.push({ offset: start, label: leaf });
+      }
+    }
+  }
+  // A literal proxy named "group[leaf]" is otherwise indistinguishable
+  // from the Chain.String() form; don't attribute an ambiguous route.
+  return matches.length === 1 ? firstLine.slice(0, matches[0].offset) + matches[0].label + rest : message;
+}
+
 /** File order is authoritative; don't invent timestamps for unstructured messages. */
-export function parseCoreLogs(text: string): CoreLogEntry[] {
+export function parseCoreLogs(
+  text: string,
+  labels?: LogRouteLabels,
+  labelsSince?: number | null,
+  leafLabels?: LogRouteLabels,
+): CoreLogEntry[] {
   if (!text.trim() || text.trim() === "暂无内核日志") return [];
   const entries: CoreLogEntry[] = [];
   const occurrences = new Map<string, number>();
+  const validLabels = (values?: LogRouteLabels) =>
+    new Map(Object.entries(values ?? {}).filter((entry): entry is [string, string] => {
+      const [key, value] = entry;
+      return !!key && !!value && !/[\r\n]/.test(key) && !/[\r\n]/.test(value);
+    }));
+  const routes = validLabels(labels);
+  const leaves = validLabels(leafLabels);
   for (const raw of text.split(/\r?\n/)) {
     if (!raw.trim()) continue;
     const parsed = parseLine(raw);
@@ -86,6 +153,12 @@ export function parseCoreLogs(text: string): CoreLogEntry[] {
       previous.message += `\n${parsed.message}`;
       previous.raw += `\n${raw}`;
       continue;
+    }
+    // Use a complete ISO timestamp with timezone, and a strict second
+    // boundary. The file may include a previous process or pre-reload rows.
+    if (labelsSince != null && (routes.size || leaves.size) && /^(?:\d{4}-\d{2}-\d{2}[T ])\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(parsed.timestamp)
+      && Math.floor(Date.parse(parsed.timestamp) / 1000) > labelsSince) {
+      parsed.message = labelRoutes(parsed.message, routes, leaves);
     }
     const count = occurrences.get(raw) ?? 0;
     occurrences.set(raw, count + 1);

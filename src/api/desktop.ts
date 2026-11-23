@@ -6,6 +6,7 @@ import type {
   UiPreferences,
   CaptureMode,
   ConnectionInfo,
+  CoreLogSnapshot,
 } from "../bindings";
 export type {
   DesktopState,
@@ -33,7 +34,7 @@ export const desktopApi = {
   setRuleEnabled: (id: string, enabled: boolean) =>
     invoke<void>("set_process_rule_enabled", { id, enabled }),
   connections: () => invoke<ConnectionInfo[]>("get_connection_details"),
-  logs: () => invoke<string>("read_core_log"),
+  logs: () => invoke<CoreLogSnapshot>("read_core_log"),
   /** Starts an elevated copy (UAC) and exits; rejects with "已取消" if declined. */
   relaunchAsAdmin: (connectTun: boolean) =>
     invoke<void>("relaunch_as_admin", { connectTun }),

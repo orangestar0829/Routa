@@ -170,7 +170,7 @@ mockIPC(
     }
     if (cmd === "get_connection_details") return [];
     if (cmd === "read_core_log")
-      return "本地界面验收环境：未启动真实内核或修改系统代理。";
+      return { text: "本地界面验收环境：未启动真实内核或修改系统代理。", routes: {}, leaves: {}, labels_since: null };
     if (cmd === "list_running_processes") return [];
     if (cmd === "set_desktop_connection")
       throw "本地界面验收环境不接管系统网络";

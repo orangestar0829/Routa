@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::config_gen::{
-    delay_fingerprints, emitted_tailscale_names, empty_config, generate_for_capture, node_proxy_name, nodes_check_config, GenInput,
+    delay_fingerprints, emitted_tailscale_names, empty_config, generate_for_capture, node_proxy_name, nodes_check_config, GenInput, RouteName, RouteNames,
 };
 use crate::core::api::{ConnectionsSnapshot, MihomoApi};
 use crate::core::apply::{Applier, ApplyOutcome, FailedListener};
@@ -204,8 +204,14 @@ struct Live {
     /// Invalidates requests started before a core change or totals reset.
     traffic_generation: u64,
     name_to_id: HashMap<String, ListenerId>,
-    /// Display names for routes in the last accepted config, retained on rejected saves.
-    connection_nodes: HashMap<String, String>,
+    /// Labels follow the last accepted config, not an edited model.
+    route_names_applied: RouteNames,
+    route_names_observed: RouteNames,
+    route_names: Arc<RouteNames>,
+    route_names_since: Option<i64>,
+    /// Invalidate snapshots in flight if route names are being replaced.
+    route_names_revision: u64,
+    route_names_updating: bool,
     stream_rate: Option<Rate>,
     last_delay_run: Option<i64>,
     delay_contexts: HashMap<String, u64>,
@@ -263,47 +269,29 @@ pub struct ConnectionInfo {
     pub process: String,
     pub target: String,
     pub node: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[specta(optional)]
+    pub route: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[specta(optional)]
+    pub raw_path: Vec<String>,
     pub protocol: String,
     pub uploaded: u64,
     pub downloaded: u64,
 }
 
-fn connection_node_names(model: &Model) -> HashMap<String, String> {
-    use crate::model::{ExitKind, NodeRef, expand, manual_proxy_name};
-    let mut names = HashMap::from([("DIRECT".into(), "直连".into())]);
-    for n in &model.manual_nodes {
-        names.insert(manual_proxy_name(n), n.name.clone());
-    }
-    for s in &model.subscriptions {
-        for n in &s.nodes { names.insert(node_proxy_name(s, n), n.name.clone()); }
-    }
-    for e in &model.exits {
-        match &e.kind {
-            ExitKind::Direct => { names.insert(e.name.clone(), "直连".into()); }
-            ExitKind::Node { node } => {
-                let label = match node {
-                    NodeRef::Subscription { name, .. } => Some(name.clone()),
-                    NodeRef::Manual { manual_id } => model.manual_nodes.iter().find(|n| &n.id == manual_id).map(|n| n.name.clone()),
-                };
-                if let Some(label) = label { names.insert(e.name.clone(), label); }
-            }
-            ExitKind::Group { members, .. } => {
-                for n in expand(model, members).nodes {
-                    if let Some(crate::model::Resolved::Copyable { base_name, .. }) = crate::model::resolve(model, &n) {
-                        if let Some(label) = names.get(&base_name).cloned() {
-                            names.insert(crate::config_gen::member_proxy_name(e, &base_name), label);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    names
-}
-
-fn connection_info(c: crate::core::api::Conn, names: &HashMap<String, String>) -> ConnectionInfo {
-    let route = c.chains.first().map(String::as_str).unwrap_or("");
-    let node = names.get(route).map(String::as_str).unwrap_or(route);
+fn connection_info(c: crate::core::api::Conn, names: &RouteNames) -> ConnectionInfo {
+    // The pinned core reports the actual leaf first and groups after it.
+    // A group-only route or an unknown first element cannot prove a node.
+    let leaf = c.chains.first().and_then(|id| names.get(id));
+    let (node, route) = match leaf {
+        Some(RouteName::Node { name, path }) => (name.clone(), path.clone()),
+        Some(RouteName::Route(label) | RouteName::Terminal(label)) => (String::new(), Some(label.clone())),
+        None => (String::new(), c.chains.iter().skip(1).find_map(|id| match names.get(id) {
+            Some(RouteName::Route(label)) => Some(label.clone()),
+            _ => None,
+        })),
+    };
     let host = if c.metadata.host.is_empty() { &c.metadata.destination_ip } else { &c.metadata.host };
     let target = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{}", c.metadata.destination_port)
@@ -314,16 +302,28 @@ fn connection_info(c: crate::core::api::Conn, names: &HashMap<String, String>) -
         id: c.id,
         listener: if c.metadata.inbound_name.starts_with(crate::model::hidden::HIDDEN_NAME_PREFIX) {
             crate::model::hidden::HIDDEN_ENTRY_LABEL.to_owned()
+        } else if c.metadata.inbound_name.starts_with("__fetch__") {
+            "订阅更新".into()
         } else {
             c.metadata.inbound_name
         },
         process: if c.metadata.process_path.is_empty() { c.metadata.process } else { c.metadata.process_path },
         target,
-        node: node.to_owned(),
+        node,
+        route,
+        raw_path: c.chains,
         protocol: c.metadata.network.to_uppercase(),
         uploaded: c.upload,
         downloaded: c.download,
     }
+}
+
+#[derive(Debug, serde::Serialize, specta::Type)]
+pub struct CoreLogSnapshot {
+    pub text: String,
+    pub routes: HashMap<String, String>,
+    pub leaves: HashMap<String, String>,
+    pub labels_since: Option<i64>,
 }
 
 pub struct Runtime {
@@ -667,7 +667,12 @@ impl Inner {
             live.delay_generation += 1;
             live.traffic_generation += 1;
             live.name_to_id.clear();
-            live.connection_nodes.clear();
+            live.route_names_applied = RouteNames::default();
+            live.route_names_observed = RouteNames::default();
+            live.route_names = Arc::default();
+            live.route_names_since = None;
+            live.route_names_updating = false;
+            live.route_names_revision += 1;
             live.stream_rate = None;
             let totals = self.traffic.lock().unwrap().totals.clone();
             self.publish_traffic(
@@ -903,7 +908,7 @@ impl Inner {
         let tailscales = emitted_tailscale_names(model, &nics);
         let outcome = match core.as_mut() {
             Some(run) => {
-                let generated = generate_for_capture(
+                let mut generated = generate_for_capture(
                     &GenInput {
                         model,
                         health: &health,
@@ -917,6 +922,14 @@ impl Inner {
                     return Err(RestartDnsCore);
                 }
                 let plan = generated.plan.clone();
+                let next_route_names = std::mem::take(&mut generated.route_names);
+                {
+                    let mut live = self.live.lock().unwrap();
+                    if live.route_names_applied != next_route_names {
+                        live.route_names_updating = true;
+                        live.route_names_revision += 1;
+                    }
+                }
                 let CoreRun {
                     handle,
                     applier,
@@ -944,7 +957,15 @@ impl Inner {
                 let mut live = self.live.lock().unwrap();
                 match &out {
                     ApplyOutcome::Reloaded { .. } => {
-                        live.connection_nodes = connection_node_names(model);
+                        if live.route_names_updating {
+                            live.route_names_observed.merge(next_route_names.clone());
+                            live.route_names = Arc::new(next_route_names.unambiguous(&live.route_names_observed));
+                            live.route_names_applied = next_route_names;
+                            // Allow only records in subsequent whole seconds;
+                            // rotation and legacy log formats do not share a
+                            // reliable sub-second boundary.
+                            live.route_names_since = Some(now_unix());
+                        }
                         live.name_to_id = plan
                             .listeners
                             .iter()
@@ -953,10 +974,20 @@ impl Inner {
                     }
                     ApplyOutcome::FailedClosed { .. } | ApplyOutcome::FailedCoreStopped { .. } => {
                         live.name_to_id.clear();
-                        live.connection_nodes.clear();
+                        if matches!(out, ApplyOutcome::FailedClosed { .. }) {
+                            // The candidate may have been live before fallback
+                            // (e.g. reload succeeded but selecting a group failed).
+                            // Pending dials can outlive the empty config.
+                            live.route_names_observed.merge(next_route_names);
+                        }
+                        live.route_names_applied = RouteNames::default();
+                        live.route_names = Arc::default();
+                        live.route_names_since = None;
+                        live.route_names_revision += 1;
                     }
                     ApplyOutcome::FailedKeptPrevious { .. } | ApplyOutcome::NotRunning { .. } => {}
                 }
+                live.route_names_updating = false;
                 Some(out)
             }
             None => None,
@@ -1593,22 +1624,31 @@ impl Runtime {
     }
 
     pub async fn connection_details(&self) -> Result<Vec<ConnectionInfo>, String> {
-        let (api, names) = {
+        let (api, names, revision) = {
             let live = self.inner.live.lock().unwrap();
-            (live.api.clone().ok_or("内核未运行")?, live.connection_nodes.clone())
+            if live.route_names_updating {
+                return Err("代理配置已更新，请稍后重试".into());
+            }
+            (live.api.clone().ok_or("内核未运行")?, live.route_names.clone(), live.route_names_revision)
         };
         let snapshot = api.connections().await.map_err(|e| e.to_string())?;
         {
             let live = self.inner.live.lock().unwrap();
-            if !live.api.as_ref().is_some_and(|now| Arc::ptr_eq(now, &api)) || live.connection_nodes != names {
+            if !live.api.as_ref().is_some_and(|now| Arc::ptr_eq(now, &api)) || live.route_names_revision != revision {
                 return Err("代理配置已更新，请稍后重试".into());
             }
         }
-        Ok(snapshot
-            .connections
-            .into_iter()
-            .map(|c| connection_info(c, &names))
-            .collect())
+        Ok(snapshot.connections.into_iter().map(|c| connection_info(c, &names)).collect())
+    }
+
+    pub fn core_log_snapshot(&self, text: String) -> CoreLogSnapshot {
+        let (names, labels_since) = {
+            let live = self.inner.live.lock().unwrap();
+            if live.route_names_updating { (Arc::default(), None) }
+            else { (live.route_names.clone(), live.route_names_since) }
+        };
+        let (routes, leaves) = names.logs();
+        CoreLogSnapshot { text, routes, leaves, labels_since }
     }
 
     /// Directory holding mihomo's working files (config.yaml, mihomo.log).

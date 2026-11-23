@@ -1,7 +1,8 @@
 // Drives the packaged Windows app's own WebView2, not a browser preview.
 import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { createConnection, createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -248,6 +249,174 @@ async function applySharedRules() {
   await wait("shared rules apply finished", () => evaluate(`Array.from(document.querySelectorAll("button")).some(
     (el) => el.innerText.trim() === "保存并应用" && el.disabled && el.querySelector("[role=progressbar]") === null
   )`));
+}
+
+async function loopbackServer(server) {
+  const sockets = new Set();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await new Promise((done, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", done);
+  });
+  let closed = false;
+  return {
+    port: server.address().port,
+    async close() {
+      if (closed) return;
+      closed = true;
+      for (const socket of sockets) socket.destroy();
+      await new Promise((done) => server.close(done));
+    },
+  };
+}
+
+// This SOCKS5 test peer is not a general-purpose proxy: it only connects to
+// the single IPv4 loopback HTTP fixture owned by this smoke.
+function fixtureSocks(targetPort) {
+  return createServer((client) => {
+    let data = Buffer.alloc(0);
+    let authenticated = false;
+    const read = (chunk) => {
+      data = Buffer.concat([data, chunk]);
+      if (data.length > 8192) return client.destroy();
+      if (!authenticated) {
+        if (data.length < 2) return;
+        const end = 2 + data[1];
+        if (data.length < end) return;
+        if (data[0] !== 5 || !data.subarray(2, end).includes(0)) return client.destroy();
+        authenticated = true;
+        client.write(Buffer.from([5, 0]));
+        data = data.subarray(end);
+      }
+      if (data.length < 4) return;
+      if (data[0] !== 5 || data[1] !== 1 || data[2] !== 0) return client.destroy();
+      const addressEnd = data[3] === 1 ? 8 : data[3] === 3 && data.length >= 5 ? 5 + data[4] : null;
+      if (addressEnd === null) {
+        if (data[3] === 3 && data.length < 5) return;
+        return client.destroy();
+      }
+      if (data.length < addressEnd + 2) return;
+      const address = data[3] === 1 ? [...data.subarray(4, 8)].join(".") : data.subarray(5, addressEnd).toString("ascii");
+      if (address !== "127.0.0.1" || data.readUInt16BE(addressEnd) !== targetPort) return client.destroy();
+      client.pause();
+      client.off("data", read);
+      const upstream = createConnection({ host: "127.0.0.1", port: targetPort });
+      upstream.on("error", () => client.destroy());
+      client.once("close", () => upstream.destroy());
+      upstream.once("connect", () => {
+        client.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]));
+        upstream.write(data.subarray(addressEnd + 2));
+        upstream.pipe(client).pipe(upstream);
+      });
+    };
+    client.on("data", read);
+  });
+}
+
+async function tauriInvoke(command, args = {}) {
+  const reply = await evaluate(expression(async (name, input) => {
+    try {
+      return { value: await window.__TAURI_INTERNALS__.invoke(name, input) };
+    } catch (error) {
+      return { error: error?.message ?? JSON.stringify(error) };
+    }
+  }, command, args));
+  if (reply.error) throw new Error(`${command}: ${reply.error}`);
+  return reply.value;
+}
+
+async function checkReadableNodePaths() {
+  report.stage = "configure real loopback node display fixture";
+  const nodeName = "回环验收节点";
+  const listenerName = "节点名验收端口";
+  const marker = "ROUTA-LOOPBACK-PROBE";
+  const origin = await loopbackServer(createHttpServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.write(marker + "\n"); // Hold the connection open while capturing live UI.
+  }));
+  let socks;
+  let liveCurl;
+  try {
+    socks = await loopbackServer(fixtureSocks(origin.port));
+    const reserved = await loopbackServer(createServer());
+    const listenerPort = reserved.port;
+    await reserved.close();
+    const node = { id: "smoke-readable-node", name: nodeName, groups: [],
+      kind: { Proxy: { raw: { name: nodeName, type: "socks5", server: "127.0.0.1", port: socks.port, udp: false } } } };
+    const listener = { id: "smoke-readable-listener", name: listenerName, listener_type: "Mixed",
+      listen: "127.0.0.1", port: listenerPort, auth: null, exit: null, user_enabled: true };
+    await wait("running Mihomo for loopback name probe", async () => (await tauriInvoke("get_status")).core === "Running");
+    await tauriInvoke("save_manual_node", { n: node });
+    const outcome = await tauriInvoke("save_proxy", { l: listener, target: {
+      id: "smoke-readable-exit", name: listenerName, interface: null, kind: { Node: { node: { manual_id: node.id } } },
+    } });
+    if ("FailedCoreStopped" in outcome) throw new Error("Could not apply loopback name probe route");
+    const alias = "代理-" + listener.id;
+    const target = `127.0.0.1:${origin.port}`;
+    const curlArgs = ["-q", "--silent", "--show-error", "--no-buffer", "--noproxy", "",
+      "--socks5", `127.0.0.1:${listenerPort}`, `http://${target}/routa-node-preview`];
+    const curl = join(process.env.SystemRoot || "C:\\Windows", "System32", "curl.exe");
+    await navigate("");
+    await click('[role=tab]', "连接");
+    report.stage = "read actual loopback connection node name";
+    liveCurl = spawn(curl, [...curlArgs, "--connect-timeout", "6", "--max-time", "60"], { windowsHide: true });
+    let sawFixture = false;
+    let fixtureOutput = "";
+    let fixtureError;
+    liveCurl.stdout.on("data", (data) => {
+      fixtureOutput += data;
+      if (fixtureOutput.includes(marker)) sawFixture = true;
+    });
+    liveCurl.stderr.on("data", (data) => { fixtureError = String(data).trim(); });
+    liveCurl.on("error", (error) => { fixtureError = error.message; });
+    await wait("curl reached the real loopback upstream", () => {
+      if (fixtureError) throw new Error(fixtureError);
+      return sawFixture;
+    }, 12_000);
+    await wait("readable node in real connection table", () => evaluate(expression((name, inbound, address, rawAlias) => (
+      [...document.querySelectorAll('table[aria-label="当前连接"] tbody tr')].some((row) => {
+        const visible = row.innerText;
+        return visible.includes(name) && visible.includes(inbound) && visible.includes(address) && !visible.includes(rawAlias);
+      })
+    ), nodeName, listenerName, target, alias)));
+    await capture("12-readable-connection-node");
+
+    report.stage = "read real loopback failure with node label";
+    liveCurl.kill();
+    await socks.close();
+    // Log rendering only names aliases after the successful config generation.
+    await sleep(1200);
+    await click('[role=tab]', "日志");
+    let failed = false;
+    try {
+      await exec(curl, [...curlArgs, "--connect-timeout", "4", "--max-time", "12"], { windowsHide: true, timeout: 15_000 });
+    } catch (error) {
+      if (!Number.isInteger(error.code)) throw error;
+      failed = true;
+    }
+    if (!failed) throw new Error("Closed loopback SOCKS fixture unexpectedly still served traffic");
+    const logLabel = await wait("real core warning names the loopback node", () => evaluate(expression((name, address, rawAlias) => {
+      for (const row of document.querySelectorAll('ul[aria-label="日志记录"] > li')) {
+        const visible = row.innerText;
+        if (visible.includes(name) && visible.includes(address) && !visible.includes(rawAlias) &&
+            /(?:警告|错误)/.test(visible)) {
+          return row.querySelector("button")?.getAttribute("aria-label");
+        }
+      }
+    }, nodeName, target, alias)));
+    await click('ul[aria-label="日志记录"] button', logLabel);
+    await find('[role=region][aria-label="日志详情"] pre', nodeName, { partial: true });
+    await capture("13-readable-log-node");
+    report.nodeDisplay = { transport: "real packaged Mihomo via loopback only", node: nodeName, listener: listenerName };
+  } finally {
+    liveCurl?.kill();
+    await socks?.close();
+    await origin.close();
+  }
 }
 
 async function text(value) {
@@ -501,6 +670,7 @@ try {
   await wait("DNS editor closed after disabling", () => evaluate('!document.querySelector("[role=dialog]")'));
   await find(`${dnsSettings} .MuiChip-root`, "已关闭");
 
+  if (process.env.ROUTA_NODE_DISPLAY_SMOKE === "true") await checkReadableNodePaths();
   report.stage = "complete";
   report.status = "passed";
 } catch (error) {

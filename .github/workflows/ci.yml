@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, feat/shared-routing-rules, feat/extended-routing-rules, feat/proxy-chain, feat/dns-diversion]
+    branches: [main, feat/shared-routing-rules, feat/extended-routing-rules, feat/proxy-chain, feat/dns-diversion, feat/tun-fake-ip]
   workflow_dispatch:
 
 permissions:
@@ -58,12 +58,12 @@ jobs:
              (github.base_ref == 'feat/shared-routing-rules' && github.head_ref == 'feat/extended-routing-rules') ||
              (github.base_ref == 'feat/extended-routing-rules' && github.head_ref == 'feat/proxy-chain') ||
              (github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') ||
-             (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
+             (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip') || (github.base_ref == 'feat/tun-fake-ip' && github.head_ref == 'feat/readable-node-paths')) }}
       ROUTA_MANUAL_TUN_PREVIEW: >-
         ${{ github.repository == 'orangestar0829/Routa' &&
             github.event_name == 'pull_request' &&
             github.event.pull_request.head.repo.full_name == github.repository &&
-            github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip' }}
+            ((github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip') || (github.base_ref == 'feat/tun-fake-ip' && github.head_ref == 'feat/readable-node-paths')) }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -96,12 +96,12 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --workspace
       - name: Export DNS fixtures from the Windows-tested generator
-        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
+        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip') || (github.base_ref == 'feat/tun-fake-ip' && github.head_ref == 'feat/readable-node-paths')) }}
         env:
           ROUTA_DNS_FIXTURE_DIR: ${{ runner.temp }}\routa-dns-fixtures
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib config_gen::dns_fixtures::protected_dns_fixture_snapshot_and_optional_export -- --exact
       - name: Validate generated DNS config with the Windows Mihomo binary
-        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
+        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip') || (github.base_ref == 'feat/tun-fake-ip' && github.head_ref == 'feat/readable-node-paths')) }}
         run: |
           $fixtures = Join-Path $env:RUNNER_TEMP 'routa-dns-fixtures'
           $homeDir = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'routa-dns-core')
@@ -127,7 +127,7 @@ jobs:
           $geo = Join-Path $env:RUNNER_TEMP 'routa-dns-core/GeoSite.dat'
           node scripts/smoke-mihomo-fakeip-windows.mjs $core $fixture $geo
       - name: Upload generated DNS fixtures
-        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
+        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip') || (github.base_ref == 'feat/tun-fake-ip' && github.head_ref == 'feat/readable-node-paths')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: routa-generated-dns-fixtures
@@ -229,6 +229,7 @@ jobs:
         timeout-minutes: 8
         env:
           ROUTA_PREVIEW_EXE: ${{ steps.preview-packages.outputs.exe }}
+          ROUTA_NODE_DISPLAY_SMOKE: ${{ github.base_ref == 'feat/tun-fake-ip' && github.head_ref == 'feat/readable-node-paths' }}
         run: node scripts/smoke-routa-windows.mjs "$env:ROUTA_PREVIEW_EXE" 'pr-preview/screenshots'
       - name: Upload Windows PR preview and screenshot evidence
         if: ${{ !cancelled() && env.ROUTA_PREVIEW_PR == 'true' && steps.preview-packages.outcome == 'success' }}
@@ -242,7 +243,7 @@ jobs:
 
   dns-core:
     name: Isolated Mihomo DNS routing
-    if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
+    if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip') || (github.base_ref == 'feat/tun-fake-ip' && github.head_ref == 'feat/readable-node-paths')) }}
     needs: windows
     runs-on: ubuntu-22.04
     timeout-minutes: 12
