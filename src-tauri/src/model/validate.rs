@@ -394,16 +394,38 @@ fn validate_routing(model: &Model, errors: &mut Vec<ValidationError>) {
         }
     }
 
-    let check = |owner: &str, matcher: &RuleMatch, value: &str, errors: &mut Vec<ValidationError>| {
+    let check = |owner: &str, matcher: &RuleMatch, value: &str, action: &RuleAction, errors: &mut Vec<ValidationError>| {
         let valid = match matcher {
             RuleMatch::Domain | RuleMatch::DomainSuffix => !value.is_empty()
                 && value.len() <= 253
                 && value.split('.').all(|part| !part.is_empty()
                     && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')),
+            RuleMatch::DomainKeyword => !value.is_empty() && value.len() <= 253
+                && value.bytes().any(|c| c.is_ascii_alphanumeric())
+                && value.bytes().all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c)),
             RuleMatch::Ipv4Cidr => value.split_once('/').is_some_and(|(ip, bits)| {
                 ip.parse::<std::net::Ipv4Addr>().is_ok()
                     && bits.parse::<u8>().is_ok_and(|n| n <= 32)
             }),
+            RuleMatch::Ipv6Cidr => value.split_once('/').is_some_and(|(ip, bits)| {
+                ip.parse::<std::net::Ipv6Addr>().is_ok()
+                    && bits.parse::<u8>().is_ok_and(|n| n <= 128)
+            }),
+            RuleMatch::ProcessName => !value.chars().any(char::is_control)
+                && value.len() <= 255 && value.trim() == value
+                && !value.contains(['<', '>', '|'])
+                && routa_procsvc_proto::process_name_problem(value).is_none(),
+            RuleMatch::ProcessPath => {
+                let path = normalize_exe_path(value);
+                !value.chars().any(char::is_control)
+                    && value.len() <= 4096 && value.trim() == value
+                    && !value.contains(['*', '?', '"', '<', '>', '|'])
+                    && !value.as_bytes().get(2..).is_some_and(|rest| rest.contains(&b':'))
+                    && routa_procsvc_proto::exe_path_problem(&path).is_none()
+                    && path.get(3..).is_some_and(|rest| rest.split('\\').all(|part| {
+                        !part.is_empty() && !part.ends_with(['.', ' '])
+                    }))
+            }
             RuleMatch::Geosite => value.len() <= 128 && value.split('@').all(|tag| {
                 let t = tag.strip_prefix('!').unwrap_or(tag);
                 !t.is_empty() && t.as_bytes()[0].is_ascii_alphanumeric()
@@ -425,17 +447,41 @@ fn validate_routing(model: &Model, errors: &mut Vec<ValidationError>) {
                 what: format!("{owner} → 规则集 {value}"),
             });
         }
+        // A deleted node/group is an intentional, recoverable configuration
+        // state, but a fabricated empty target cannot be saved.
+        if let RuleAction::Target { target, .. } = action {
+            let key_ok = |key: &str| !key.trim().is_empty() && key.len() <= 512
+                && !key.chars().any(char::is_control);
+            let valid = match target {
+                ExitMember::Node(NodeRef::Manual { manual_id }) => key_ok(&manual_id.0),
+                ExitMember::Node(NodeRef::Subscription { subscription_id, name }) => {
+                    key_ok(&subscription_id.0) && key_ok(name)
+                }
+                ExitMember::Group { group: GroupRef::Custom(id) } => key_ok(&id.0),
+                ExitMember::Group { group: GroupRef::Subscription(id) } => key_ok(&id.0),
+            };
+            if !valid {
+                errors.push(ValidationError::InvalidProxy {
+                    name: owner.to_owned(), reason: "请选择规则使用的节点或节点组".into(),
+                });
+            }
+        }
     };
 
     for l in &model.listeners {
         if let Some(routing) = &l.routing {
             for r in &routing.rules {
-                check(&l.name, &r.matcher, &r.value, errors);
+                check(&l.name, &r.matcher, &r.value, &r.action, errors);
+            }
+            if matches!(&routing.unmatched, RuleAction::Target { .. }) {
+                errors.push(ValidationError::InvalidProxy {
+                    name: l.name.clone(), reason: "未匹配去向只可选用端口默认、直连或阻断".into(),
+                });
             }
         }
     }
     for (i, r) in model.shared_rules.iter().enumerate().filter(|(_, r)| r.enabled) {
-        check(&format!("共享规则 {}", i + 1), &r.matcher, &r.value, errors);
+        check(&format!("共享规则 {}", i + 1), &r.matcher, &r.value, &r.action, errors);
     }
 }
 
@@ -601,6 +647,38 @@ mod tests {
         assert!(validate(&m).is_ok());
         m.shared_rules[0].value = "cn,DIRECT".into();
         assert!(matches!(errs(&m).as_slice(), [ValidationError::InvalidProxy { .. }]));
+    }
+
+    #[test]
+    fn validates_extended_matchers_and_rejects_targets_in_unmatched() {
+        let existing_missing = ExitMember::Node(NodeRef::Manual { manual_id: ManualNodeId("removed".into()) });
+        let selected = RuleAction::Target { target: existing_missing, unavailable: RuleUnavailable::Reject };
+        let good = [
+            (RuleMatch::DomainKeyword, "api-"),
+            (RuleMatch::Ipv6Cidr, "2001:db8::/112"),
+            (RuleMatch::ProcessName, "my app.exe"),
+            (RuleMatch::ProcessPath, "C:/Program Files/Tools/probe.exe"),
+        ];
+        let bad = [
+            (RuleMatch::DomainKeyword, "api,REJECT"),
+            (RuleMatch::Ipv6Cidr, "::1/129"),
+            (RuleMatch::ProcessName, "name.exe\n"),
+            (RuleMatch::ProcessName, "C:/tools/probe.exe"),
+            (RuleMatch::ProcessName, "name|other.exe"),
+            (RuleMatch::ProcessPath, "C:/tools/../probe.exe"),
+            (RuleMatch::ProcessPath, "C:/tools//probe.exe"),
+            (RuleMatch::ProcessPath, "//server/share/probe.exe"),
+            (RuleMatch::ProcessPath, "C:/tools/probe.exe,REJECT"),
+        ];
+        let model = |matcher, value: &str| Model {
+            shared_rules: vec![SharedRule { enabled: true, matcher, value: value.into(), action: selected.clone() }],
+            ..Model::default()
+        };
+        for (matcher, value) in good { assert!(validate(&model(matcher, value)).is_ok(), "{value}"); }
+        for (matcher, value) in bad { assert!(validate(&model(matcher, value)).is_err(), "{value}"); }
+        let mut listener = Listener::new_default("port".into(), 1080);
+        listener.routing = Some(ListenerRouting { rules: vec![], unmatched: selected });
+        assert!(validate(&Model { listeners: vec![listener], ..Model::default() }).is_err());
     }
 
     #[test]

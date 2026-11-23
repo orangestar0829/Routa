@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, feat/shared-routing-rules]
   workflow_dispatch:
 
 permissions:
@@ -50,7 +50,12 @@ jobs:
       run:
         shell: pwsh
     env:
-      ROUTA_PREVIEW_PR: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.head_ref == 'feat/shared-routing-rules' }}
+      ROUTA_PREVIEW_PR: >-
+        ${{ github.repository == 'orangestar0829/Routa' &&
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            ((github.base_ref == 'main' && github.head_ref == 'feat/shared-routing-rules') ||
+             (github.base_ref == 'feat/shared-routing-rules' && github.head_ref == 'feat/extended-routing-rules')) }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

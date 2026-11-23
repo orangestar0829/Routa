@@ -34,14 +34,19 @@ import type {
   ListenerType,
   NodeRef,
   PortRule,
-  RuleAction,
 } from "../bindings";
 import { expandMembers, nodeKey, nodeLabel } from "../lib/refs";
 import { FormDialog } from "../components/FormDialog";
 import { InterfacePicker } from "../components/InterfacePicker";
 import { MemberPicker } from "../components/MemberPicker";
 import { NodePicker } from "../components/NodePicker";
-import { ACTION_LABELS, MATCH_LABELS, RULE_ACTIONS, RULE_MATCHERS } from "../lib/sharedRouting";
+import { RouteActionFields } from "../components/RouteActionFields";
+import {
+  ACTION_LABELS, MATCH_LABELS, RULE_ACTIONS, RULE_MATCHERS, RULE_VALUE_EXAMPLES, completeRuleAction,
+  ruleActionLabel, ruleMatcherHint, targetUnavailable, type BaseRuleAction, type DraftRuleAction,
+} from "../lib/sharedRouting";
+
+type DraftPortRule = Omit<PortRule, "action"> & { action: DraftRuleAction };
 
 // `existing` must only contain visible listeners; candidates skip the hidden port range.
 function proposePort(existing: Listener[]) {
@@ -118,12 +123,14 @@ export function ListenerDialog({
       ? target.kind.Group
       : { strategy: "UrlTest" as GroupStrategy, members: [], selected: null },
   );
-  const [rules, setRules] = useState<PortRule[]>(l.routing?.rules ?? []);
+  const [rules, setRules] = useState<DraftPortRule[]>(l.routing?.rules ?? []);
+  const [targetErr, setTargetErr] = useState<number>();
   const shared = m?.shared_rules?.filter((r) => r.enabled) ?? [];
   const providers = m?.shared_rule_providers ?? [];
   const inherits = !!l.inherit_shared_rules;
-  const [unmatched, setUnmatched] = useState<RuleAction>(
-    l.routing?.unmatched ?? "Proxy",
+  const storedFallback = l.routing?.unmatched;
+  const [unmatched, setUnmatched] = useState<BaseRuleAction>(
+    typeof storedFallback === "object" ? "Reject" : storedFallback ?? "Proxy",
   );
   const [choosingNode, setChoosingNode] = useState(false);
   const [probe, setProbe] = useState("");
@@ -137,6 +144,17 @@ export function ListenerDialog({
     if (!Number.isInteger(p) || p < 1 || p > 65535) {
       setError("端口需在 1–65535 之间");
       return;
+    }
+    const submittedRules: PortRule[] = [];
+    if (mode === "rules") {
+      for (const [index, rule] of rules.entries()) {
+        if (!completeRuleAction(rule.action)) {
+          setTargetErr(index);
+          setError(`第 ${index + 1} 条端口规则：请选择指定的节点或组`);
+          return;
+        }
+        submittedRules.push({ ...rule, value: rule.value.trim(), action: rule.action });
+      }
     }
     let destination: ExitKind = "Direct";
     if (mode !== "direct") {
@@ -176,7 +194,7 @@ export function ListenerDialog({
           ? "::1"
           : "127.0.0.1",
       port: p,
-      routing: mode === "rules" ? { rules, unmatched } : null,
+      routing: mode === "rules" ? { rules: submittedRules, unmatched } : null,
       inherit_shared_rules: inherits,
     };
     try {
@@ -205,10 +223,16 @@ export function ListenerDialog({
         ? null : octets.reduce((a, b) => (a * 256 + b) >>> 0, 0);
     };
     for (const { rule, source } of ordered) {
-      const v = rule.value.toLowerCase();
+      const v = rule.value.trim().toLowerCase();
       let hit: boolean;
+      if (!v) {
+        setProbeResult(`${source}还有空白匹配项，请先补全。`);
+        return;
+      }
       if (rule.matcher === "Domain") hit = input === v;
       else if (rule.matcher === "DomainSuffix") hit = input === v || input.endsWith(`.${v}`);
+      else if (rule.matcher === "DomainKeyword") hit = /^[a-z0-9.-]+$/.test(input)
+        && ipv4(input) === null && input.includes(v);
       else if (rule.matcher === "Ipv4Cidr") {
         const inputIp = ipv4(input);
         if (inputIp === null) {
@@ -224,7 +248,12 @@ export function ListenerDialog({
         return;
       }
       if (hit) {
-        setProbeResult(`匹配 ${source}：${rule.value} → ${ACTION_LABELS[rule.action]}`);
+        const action = rule.action;
+        const outlet = ruleActionLabel(action, m);
+        const description = typeof action === "string" ? outlet : action.Target.target
+          ? `指定出口 ${outlet}（不可用时${ACTION_LABELS[targetUnavailable(action)]}，实际状态由内核判断）`
+          : outlet;
+        setProbeResult(`匹配 ${source}：${rule.value} → ${description}`);
         return;
       }
     }
@@ -434,34 +463,26 @@ export function ListenerDialog({
                           {providers.map((p) => <MenuItem key={p.name} value={p.name}>{p.name}</MenuItem>)}
                         </TextField>
                       ) : (
-                        <TextField label="匹配内容" value={r.value}
-                          onChange={(e) => setRules(rules.map((x, j) => j === i ? { ...x, value: e.target.value.trim() } : x))} />
+                        <TextField label="匹配内容" value={r.value} placeholder={RULE_VALUE_EXAMPLES[r.matcher]}
+                          helperText={ruleMatcherHint(r.matcher)}
+                          onChange={(e) => setRules(rules.map((x, j) => j === i ? { ...x, value: e.target.value } : x))} />
                       )}
-                      <TextField
-                        select
-                        label="处理方式"
-                        value={r.action}
-                        onChange={(e) =>
-                          setRules(
-                            rules.map((x, j) =>
-                              j === i
-                                ? { ...x, action: e.target.value as RuleAction }
-                                : x,
-                            ),
-                          )
-                        }
-                      >
-                        {RULE_ACTIONS.map(([v, t]) => (
-                          <MenuItem key={v} value={v}>
-                            {t}
-                          </MenuItem>
-                        ))}
-                      </TextField>
+                      <RouteActionFields action={r.action} error={targetErr === i ? "请选择节点或组" : undefined}
+                        onChange={(action) => {
+                          setRules(rules.map((x, j) => j === i ? { ...x, action } : x));
+                          if (targetErr === i) {
+                            setTargetErr(undefined);
+                            setError("");
+                          }
+                          setProbeResult("");
+                        }} />
                       <Button
                         color="error"
-                        onClick={() =>
-                          setRules(rules.filter((_, j) => j !== i))
-                        }
+                        onClick={() => {
+                          setRules(rules.filter((_, j) => j !== i));
+                          if (targetErr !== undefined) { setTargetErr(undefined); setError(""); }
+                          setProbeResult("");
+                        }}
                       >
                         移除规则
                       </Button>
@@ -482,7 +503,7 @@ export function ListenerDialog({
                   select
                   label="未匹配去向"
                   value={unmatched}
-                  onChange={(e) => setUnmatched(e.target.value as RuleAction)}
+                  onChange={(e) => setUnmatched(e.target.value as BaseRuleAction)}
                 >
                   {RULE_ACTIONS.map(([v, t]) => (
                     <MenuItem key={v} value={v}>

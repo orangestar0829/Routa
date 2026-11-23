@@ -22,15 +22,12 @@ const getOptionLabel = (o: Option) => o.label;
 const isOptionEqualToValue = (a: Option, b: Option) => memberKey(a.member) === memberKey(b.member);
 const getOptionKey = (o: Option) => memberKey(o.member);
 
-export function MemberPicker({
-  value,
-  onChange,
-  label,
-}: {
-  value: ExitMember[];
-  onChange: (v: ExitMember[]) => void;
-  label?: string;
-}) {
+type Props = { label?: string; disabled?: boolean; error?: string } & (
+  | { multiple?: true; value: ExitMember[]; onChange: (v: ExitMember[]) => void }
+  | { multiple: false; value: ExitMember | null; onChange: (v: ExitMember | null) => void }
+);
+
+export function MemberPicker(props: Props) {
   const model = useModel();
   const status = useStatus();
 
@@ -71,36 +68,46 @@ export function MemberPicker({
   const latency = (o: Option) => {
     if (isGroupMember(o.member) || !model.data) return "";
     const key = proxyNameOf(model.data, o.member);
-    const d = key ? status.data?.delays[key] : undefined;
+    const d = key ? status.data?.delays?.[key] : undefined;
     if (!d) return "";
     return delayText(d);
   };
 
-  return (
-    <Autocomplete
-      multiple
-      options={options}
-      groupBy={groupBy}
-      getOptionLabel={getOptionLabel}
-      isOptionEqualToValue={isOptionEqualToValue}
-      getOptionKey={getOptionKey}
-      noOptionsText="没有可选成员"
-      value={value.map(optionFor)}
-      onChange={(_, v) => onChange(v.map((o) => o.member))}
-      renderOption={(p, o) => {
-        const { key: k, ...rest } = p as React.HTMLAttributes<HTMLLIElement> & { key?: string };
-        return (
-          <li key={k} {...rest}>
-            <Box sx={{ display: "flex", width: "100%", justifyContent: "space-between", gap: 2 }}>
-              <span>{o.label}</span>
-              <Typography component="span" variant="body2" color="text.secondary">
-                {latency(o)}
-              </Typography>
-            </Box>
-          </li>
-        );
-      }}
-      renderInput={(params) => <TextField {...params} label={label ?? "成员"} size="small" />}
-    />
-  );
+  const common = {
+    options,
+    groupBy,
+    getOptionLabel,
+    isOptionEqualToValue,
+    getOptionKey,
+    disabled: props.disabled,
+    noOptionsText: "没有可选成员",
+    renderOption: (p: React.HTMLAttributes<HTMLLIElement>, o: Option) => {
+      const { key: k, ...rest } = p as React.HTMLAttributes<HTMLLIElement> & { key?: string };
+      return (
+        <li key={k} {...rest}>
+          <Box sx={{ display: "flex", width: "100%", justifyContent: "space-between", gap: 2 }}>
+            <span>{o.label}</span>
+            <Typography component="span" variant="body2" color="text.secondary">
+              {latency(o)}
+            </Typography>
+          </Box>
+        </li>
+      );
+    },
+    renderInput: (params: React.ComponentProps<typeof TextField>) => (
+      <TextField {...params} label={props.label ?? "成员"} size="small"
+        error={!!props.error} helperText={props.error} />
+    ),
+  };
+
+  if (props.multiple === false) {
+    const onChange = props.onChange;
+    return <Autocomplete {...common}
+      value={props.value ? optionFor(props.value) : null}
+      onChange={(_, v) => onChange(v?.member ?? null)} />;
+  }
+
+  const onChange = props.onChange;
+  return <Autocomplete {...common} multiple
+    value={props.value.map(optionFor)} onChange={(_, v) => onChange(v.map((o) => o.member))} />;
 }
