@@ -76,9 +76,11 @@ const evaluate = async (expression) => {
 };
 const expression = (fn, ...args) => `(${fn.toString()})(...${JSON.stringify(args)})`;
 
-function locate(selector, label, partial, input, operation) {
+function locate(selector, label, partial, input, operation, listboxId) {
+  const root = listboxId ? document.getElementById(listboxId) : document;
+  if (!root || (listboxId && root.getAttribute("role") !== "listbox")) return null;
   const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim();
-  for (const match of document.querySelectorAll(selector)) {
+  for (const match of root.querySelectorAll(selector)) {
     const labelledBy = (match.getAttribute("aria-labelledby") ?? "").split(/\s+/)
       .map((id) => document.getElementById(id)?.textContent);
     const names = [match.innerText, match.textContent, match.getAttribute("aria-label"), ...labelledBy].map(normalize);
@@ -86,11 +88,20 @@ function locate(selector, label, partial, input, operation) {
     const el = input ? (match.control || match.querySelector("input")) : match;
     if (!el || el.disabled || el.getAttribute("aria-disabled") === "true" ||
         el.getClientRects().length === 0) continue;
-    el.scrollIntoView({ block: "center", inline: "nearest" });
+    if (operation !== "inspect") el.scrollIntoView({ block: "center", inline: "nearest" });
+    if (operation === "target") {
+      if (el.closest('[aria-hidden="true"], [inert]')) continue;
+      const bounds = el.getBoundingClientRect();
+      const x = bounds.left + bounds.width / 2;
+      const y = bounds.top + bounds.height / 2;
+      // Ignore closing portals, backdrops, and other content covering this control.
+      if (!el.contains(document.elementFromPoint(x, y))) continue;
+      return { x, y };
+    }
     if (operation === "click") el.click();
     if (operation === "focus") el.focus();
     return { checked: el.checked ?? null, value: el.value ?? null, text: normalize(el.innerText),
-      expanded: el.getAttribute("aria-expanded"),
+      expanded: el.getAttribute("aria-expanded"), controls: el.getAttribute("aria-controls"),
       pressed: el.getAttribute("aria-pressed") === "true" };
   }
   return null;
@@ -134,17 +145,31 @@ async function chooseNamedNode(label, name) {
   });
 }
 
+async function pointerClick({ x, y }) {
+  await call("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
+  await call("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+  await call("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+}
+
 async function chooseDialogOption(label, value) {
   const select = '[role=dialog] [role=combobox]';
-  await find(select, label, { operation: "focus" });
-  // MUI's non-native select opens on keydown/mousedown, not DOM click.
-  const key = { key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40 };
-  await call("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
-  await call("Input.dispatchKeyEvent", { type: "keyUp", ...key });
-  await click('[role=option]', value);
-  await wait(`${label} = ${value}`, async () => (await evaluate(
-    expression(locate, select, label, false, false),
-  ))?.text === value);
+  // A keyboard event can hit the previous Select while its popup is restoring
+  // focus. Open this exact combobox using its own hit-tested pointer position.
+  await pointerClick(await find(select, label, { operation: "target" }));
+  const listbox = await wait(`${label} opens its own listbox`, async () => {
+    const state = await evaluate(expression(locate, select, label, false, false, "inspect"));
+    return state?.expanded === "true" && state.controls;
+  });
+  // MUI portals stay mounted while closing. Never click an option from another
+  // popup just because it has the same visible text (e.g. 直连).
+  const option = await wait(`${label} option ${value} is clickable`, () => evaluate(
+    expression(locate, '[role="option"]', value, false, false, "target", listbox),
+  ));
+  await pointerClick(option);
+  await wait(`${label} = ${value}`, async () => {
+    const state = await evaluate(expression(locate, select, label, false, false, "inspect"));
+    return state?.expanded === "false" && state.text === value;
+  });
 }
 
 async function addLoopbackNode(name, port) {
