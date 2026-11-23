@@ -2,7 +2,7 @@
 //!
 //! Run: MIHOMO_BIN=<path to mihomo exe> cargo test --test e2e_real_core -- --ignored --nocapture
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv6Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
