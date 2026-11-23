@@ -233,4 +233,4 @@ jobs:
           gzip -dc "$file" > "$RUNNER_TEMP/mihomo-dns-test"
           chmod +x "$RUNNER_TEMP/mihomo-dns-test"
       - name: Verify DNS egress and no fallback in a private network namespace
-        run: sudo python3 scripts/smoke-mihomo-dns.py "$RUNNER_TEMP/mihomo-dns-test" --fixture-dir "$RUNNER_TEMP/routa-dns-fixtures"
+        run: python3 scripts/smoke-mihomo-dns.py "$RUNNER_TEMP/mihomo-dns-test" --fixture-dir "$RUNNER_TEMP/routa-dns-fixtures"
