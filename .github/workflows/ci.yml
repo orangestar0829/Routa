@@ -212,7 +212,7 @@ jobs:
     name: Isolated Mihomo DNS routing
     if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion' }}
     needs: windows
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
