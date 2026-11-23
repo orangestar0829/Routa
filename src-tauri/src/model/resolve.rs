@@ -15,11 +15,96 @@ pub fn tailscale_state_dir(id: &ManualNodeId) -> String {
     format!("tailscale/{}", id.0)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ChainHop<'a> {
+    pub raw: &'a serde_json::Value,
+    pub manual: bool,
+}
+
+pub fn is_chain_ref(model: &Model, r: &NodeRef) -> bool {
+    matches!(r, NodeRef::Manual { manual_id } if model.manual_nodes.iter()
+        .any(|node| &node.id == manual_id && matches!(node.kind, ManualNodeKind::Chain { .. })))
+}
+
+pub fn member_has_chain(model: &Model, member: &ExitMember) -> bool {
+    match member {
+        ExitMember::Node(r) => is_chain_ref(model, r),
+        ExitMember::Group { group: GroupRef::Custom(id) } => {
+            model.manual_nodes.iter().any(|n| n.groups.contains(id)
+                && matches!(n.kind, ManualNodeKind::Chain { .. }))
+                || model.node_groups.iter().find(|g| &g.id == id)
+                    .is_some_and(|g| g.members.iter().any(|r| is_chain_ref(model, r)))
+        }
+        ExitMember::Group { group: GroupRef::Subscription(_) } => false,
+    }
+}
+
+/// The allowlist is intentionally narrow: these built-in TCP adapters use
+/// mihomo's configured dialer. UDP-based transports/SS plugins and non-proxy
+/// adapters must not be accepted as an implicit alternative path.
+fn supported_tcp_hop(raw: &serde_json::Value) -> bool {
+    let Some(raw) = raw.as_object() else { return false };
+    // mihomo's decoder uses a case-insensitive fallback for option keys.
+    // Require canonical spellings for the keys we validate, including when
+    // an alias occurs alongside the canonical key. Reject Unicode aliases
+    // (Go's EqualFold also folds K/ſ) and YAML merge keys at this boundary.
+    const CHECKED_KEYS: [&str; 5] = ["type", "server", "port", "network", "plugin"];
+    if raw.keys().any(|key| {
+        !key.is_ascii() || key == "<<" || CHECKED_KEYS.iter().any(|canonical| {
+            key.as_str() != *canonical && key.eq_ignore_ascii_case(canonical)
+        })
+    }) {
+        return false;
+    }
+    let Some(typ) = raw.get("type").and_then(|v| v.as_str()) else { return false };
+    if !matches!(typ, "http" | "socks5" | "ss" | "vmess" | "vless" | "trojan")
+        || !raw.get("server").and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty())
+    {
+        return false;
+    }
+    if !raw.get("port").and_then(|p| p.as_u64().or_else(|| {
+        let value = p.as_str()?;
+        value.bytes().all(|c| c.is_ascii_digit()).then(|| value.parse().ok()).flatten()
+    }))
+        .is_some_and(|p| (1..=65535).contains(&p))
+    {
+        return false;
+    }
+    if let Some(transport) = raw.get("network") {
+        if !transport.as_str().is_some_and(|t| matches!(t,
+            "" | "tcp" | "ws" | "grpc" | "http" | "h2" | "httpupgrade"))
+        {
+            return false;
+        }
+    }
+    if raw.get("plugin").is_some_and(|p| p.as_str() != Some("")) {
+        return false;
+    }
+    true
+}
+
+/// Resolve a single ordinary hop without ever recursing into another chain.
+pub fn resolve_chain_hop<'a>(model: &'a Model, r: &NodeRef) -> Option<ChainHop<'a>> {
+    let (raw, manual) = match r {
+        NodeRef::Subscription { subscription_id, name } => {
+            let sub = model.subscriptions.iter().find(|s| &s.id == subscription_id)?;
+            (&sub.nodes.iter().find(|n| &n.name == name)?.raw, false)
+        }
+        NodeRef::Manual { manual_id } => {
+            let node = model.manual_nodes.iter().find(|n| &n.id == manual_id)?;
+            let ManualNodeKind::Proxy { raw } = &node.kind else { return None };
+            (raw, true)
+        }
+    };
+    supported_tcp_hop(raw).then_some(ChainHop { raw, manual })
+}
+
 pub enum Resolved<'a> {
     /// Copyable per exit; base_name = "<订阅>/<节点>" or "手动/<名>".
     /// `manual`: a manual proxy node (gets the manual-node defaults).
     Copyable { base_name: String, raw: &'a serde_json::Value, manual: bool },
     Tailscale { node: &'a ManualNode, opts: &'a TailscaleOpts },
+    Chain { node: &'a ManualNode, entry: ChainHop<'a>, exit: ChainHop<'a> },
 }
 
 pub fn resolve<'a>(model: &'a Model, r: &NodeRef) -> Option<Resolved<'a>> {
@@ -36,6 +121,10 @@ pub fn resolve<'a>(model: &'a Model, r: &NodeRef) -> Option<Resolved<'a>> {
                     Some(Resolved::Copyable { base_name: manual_proxy_name(node), raw, manual: true })
                 }
                 ManualNodeKind::Tailscale(opts) => Some(Resolved::Tailscale { node, opts }),
+                ManualNodeKind::Chain { entry, exit } if entry != exit => Some(Resolved::Chain {
+                    node, entry: resolve_chain_hop(model, entry)?, exit: resolve_chain_hop(model, exit)?,
+                }),
+                ManualNodeKind::Chain { .. } => None,
             }
         }
     }
@@ -120,6 +209,39 @@ pub fn exit_tailscales<'a>(model: &'a Model, exit: &Exit) -> Vec<&'a ManualNode>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn chain_hops_require_unambiguous_transport_keys_and_values() {
+        for raw in [
+            json!({"type":"vless", "server":"example.test", "port":443, "network":"ws",
+                   "ws_opts":{"headers":{"X-客户端": "ok"}}, "IP_VERSION":"dual"}),
+            json!({"type":"ss", "server":"example.test", "port":"1080", "plugin":""}),
+            json!({"type":"http", "server":"example.test", "port":80}),
+        ] {
+            assert!(supported_tcp_hop(&raw), "{raw}");
+        }
+        for (ty, key, value) in [
+            ("vless", "network", json!("mkcp")),
+            ("vless", "Network", json!("mkcp")),
+            ("vless", "networK", json!("mkcp")),
+            ("vless", "network", json!("WS")),
+            ("ss", "plugin", json!("kcptun")),
+            ("ss", "Plugin", json!("kcptun")),
+            ("ss", "PLUGIN", json!("")),
+            ("http", "TYPE", json!("hysteria2")),
+            ("http", "Server", json!("alternate.test")),
+            ("http", "PORT", json!(1080)),
+            ("vless", "<<", json!({"network":"mkcp"})),
+        ] {
+            let mut raw = json!({"type":ty, "server":"example.test", "port":443});
+            raw[key] = value;
+            assert!(!supported_tcp_hop(&raw), "{raw}");
+        }
+        let duplicate = json!({"type":"vless", "server":"example.test", "port":443,
+                               "network":"tcp", "NETWORK":"mkcp"});
+        assert!(!supported_tcp_hop(&duplicate));
+    }
 
     fn mnode(id: &str, name: &str, groups: &[&str]) -> ManualNode {
         ManualNode {

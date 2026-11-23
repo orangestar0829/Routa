@@ -789,7 +789,12 @@ export type ManualNodeKind =
 /**
  * 原样的 mihomo proxy 映射
  */
-{ Proxy: { raw: JsonValue } } | { Tailscale: TailscaleOpts }
+{ Proxy: { raw: JsonValue } } | { Tailscale: TailscaleOpts } |
+/**
+ * Fixed TCP route: the local core dials `entry`, which reaches `exit`.
+ * The chain is itself a manual node with an independent stable UUID.
+ */
+{ Chain: { entry: NodeRef; exit: NodeRef } }
 export type Model = { subscriptions: Subscription[]; exits: Exit[]; listeners: Listener[]; settings: Settings; manual_nodes: ManualNode[]; node_groups: NodeGroup[]; process_routing: ProcessRouting; shared_rules?: SharedRule[]; shared_rule_providers?: SharedRuleProvider[] }
 /**
  * Why a target failed a round.
@@ -863,8 +868,8 @@ export type NodeRef = { subscription_id: SubscriptionId; name: string } | { manu
  */
 export type ParsedProxy = { raw: JsonValue; 
 /**
- * Keys removed from the paste, a subset of
- * `["interface-name", "routing-mark", "dialer-proxy"]` in that order.
+ * Keys removed from the paste, grouped by `interface-name`,
+ * `routing-mark`, and `dialer-proxy`, including alternate spellings.
  */
 stripped: string[] }
 export type PortRule = { matcher: RuleMatch; value: string; action: RuleAction }

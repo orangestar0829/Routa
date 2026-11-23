@@ -46,6 +46,12 @@ System proxy affects applications that honor Windows proxy settings. For applica
 
 Stopping system proxy or TUN leaves the core and proxy ports available; manually configured clients and independently enabled process-routing rules may still use them.
 
+### Two-hop proxy chains
+
+Under **节点 → 新增 → 新增代理链** (Nodes → Add → Add Proxy Chain), choose an entry hop and an exit hop. Select the saved chain as a single fixed port outbound or a specific rule target. Measure its end-to-end delay in Nodes. If the original subscription node can no longer be resolved, repair the hop manually; Routa does not choose another node.
+
+The first version supports TCP with eligible HTTP, SOCKS5, Shadowsocks without plugins, VMess, VLESS, and Trojan nodes. UDP, nested chains, Tailscale, and using chains as strategy-group members are not supported. A connection timeout never falls back to Direct. Only an explicit Direct rule, or an explicitly configured Direct policy for a rule whose target can no longer be resolved, uses that route.
+
 ## Shared routing rules
 
 In Full mode, open **共享规则** (Shared rules) to edit, reorder, and toggle common rules or add the mainland-China direct preset. To use a remote mihomo rule set, register it first and then reference it from a `RULE-SET` rule. Routa fetches these sources directly, independently of proxy ports; prefer trusted HTTPS sources.

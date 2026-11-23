@@ -57,7 +57,7 @@ pub fn in_use_nodes(model: &Model) -> InUseNodes {
 /// Display name of a node: the subscription node's name or the manual node's name.
 fn node_name(model: &Model, r: &NodeRef) -> Option<String> {
     match resolve(model, r)? {
-        Resolved::Tailscale { node, .. } => Some(node.name.clone()),
+        Resolved::Tailscale { node, .. } | Resolved::Chain { node, .. } => Some(node.name.clone()),
         Resolved::Copyable { .. } => match r {
             NodeRef::Subscription { name, .. } => Some(name.clone()),
             NodeRef::Manual { manual_id } => model.manual_nodes.iter().find(|n| &n.id == manual_id).map(|n| n.name.clone()),
@@ -70,7 +70,7 @@ fn node_name(model: &Model, r: &NodeRef) -> Option<String> {
 fn own_proxy_name(model: &Model, r: &NodeRef) -> Option<String> {
     match resolve(model, r)? {
         Resolved::Copyable { base_name, .. } => Some(base_name),
-        Resolved::Tailscale { node, .. } => Some(manual_proxy_name(node)),
+        Resolved::Tailscale { node, .. } | Resolved::Chain { node, .. } => Some(manual_proxy_name(node)),
     }
 }
 

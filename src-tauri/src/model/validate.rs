@@ -288,6 +288,26 @@ fn validate_manual(model: &Model, errors: &mut Vec<ValidationError>) {
                     bad.push("hostname 不能为空");
                 }
             }
+            ManualNodeKind::Chain { entry, exit } => {
+                if entry == exit { bad.push("前置节点与落地节点不能相同"); }
+                if !n.groups.is_empty() { bad.push("代理链暂不支持加入节点组"); }
+                for hop in [entry, exit] {
+                    // A subscription is externally mutable. Leave a missing
+                    // subscription hop unresolved so unrelated edits and
+                    // subscription updates remain possible without retargeting.
+                    if let NodeRef::Manual { manual_id } = hop {
+                        if !manual_ids.contains(manual_id) {
+                            errors.push(ValidationError::DanglingRef {
+                                what: format!("代理链「{}」仍引用节点 {}", n.name, manual_id.0),
+                            });
+                        } else if super::resolve::is_chain_ref(model, hop) {
+                            bad.push("不支持嵌套代理链");
+                        } else if super::resolve::resolve_chain_hop(model, hop).is_none() {
+                            bad.push("代理链只能使用支持的普通 TCP 代理节点");
+                        }
+                    }
+                }
+            }
         }
         for reason in bad {
             errors.push(ValidationError::InvalidProxy { name: n.name.clone(), reason: reason.to_string() });
@@ -298,6 +318,14 @@ fn validate_manual(model: &Model, errors: &mut Vec<ValidationError>) {
                     what: format!("manual node[{}].groups -> {}", n.name, g.0),
                 });
             }
+        }
+    }
+
+    for group in &model.node_groups {
+        if group.members.iter().any(|r| super::resolve::is_chain_ref(model, r)) {
+            errors.push(ValidationError::InvalidProxy {
+                name: group.name.clone(), reason: "代理链暂不支持加入节点组".into(),
+            });
         }
     }
 
@@ -315,7 +343,14 @@ fn validate_manual(model: &Model, errors: &mut Vec<ValidationError>) {
             ExitKind::Group { members, selected, .. } => {
                 for m in members {
                     match m {
-                        ExitMember::Node(r) => check_node(r, "members"),
+                        ExitMember::Node(r) => {
+                            check_node(r, "members");
+                            if super::resolve::is_chain_ref(model, r) {
+                                errors.push(ValidationError::InvalidProxy {
+                                    name: e.name.clone(), reason: "代理链暂不支持作为策略组成员".into(),
+                                });
+                            }
+                        }
                         ExitMember::Group { group: GroupRef::Custom(gid) } => {
                             if !group_ids.contains(gid) {
                                 errors.push(ValidationError::DanglingRef {

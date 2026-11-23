@@ -393,6 +393,7 @@ export function ListenerDialog({
                       ))}
                     </TextField>
                     <MemberPicker
+                      excludeChains
                       value={group.members}
                       onChange={(members) => setGroup({ ...group, members })}
                     />

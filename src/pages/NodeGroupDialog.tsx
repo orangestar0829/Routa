@@ -35,7 +35,7 @@ export function NodeGroupDialog({
         label: `${n.name} · ${s.name}`,
       })),
     ),
-    ...(model.data?.manual_nodes ?? []).map((n) => ({
+    ...(model.data?.manual_nodes ?? []).filter((n) => !("Chain" in n.kind)).map((n) => ({
       ref: { manual_id: n.id } as NodeRef,
       label: `${n.name} · ${"Tailscale" in n.kind ? "Tailscale" : "手动"}`,
     })),

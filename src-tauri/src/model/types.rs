@@ -405,6 +405,9 @@ pub enum ManualNodeKind {
     /// 原样的 mihomo proxy 映射
     Proxy { raw: serde_json::Value },
     Tailscale(TailscaleOpts),
+    /// Fixed TCP route: the local core dials `entry`, which reaches `exit`.
+    /// The chain is itself a manual node with an independent stable UUID.
+    Chain { entry: NodeRef, exit: NodeRef },
 }
 
 impl Default for ManualNodeKind {

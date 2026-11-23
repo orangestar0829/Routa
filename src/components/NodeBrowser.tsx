@@ -2,6 +2,7 @@ import { useState, type KeyboardEvent } from "react";
 import { Box, Button, Typography } from "@mui/material";
 import { useModel, useStatus, useTestDelays } from "../api/client";
 import { candidateNodeGroups } from "../lib/nodeGroups";
+import { chainProblem } from "../lib/proxyChain";
 import { nodeKey, nodeLabel, proxyNameOf } from "../lib/refs";
 import { FixedCardGrid } from "./FixedCardGrid";
 import { NodeCard } from "./NodeCard";
@@ -33,7 +34,7 @@ export function useNodeBrowser(members: NodeRef[]) {
         : undefined;
     const source =
       sub?.name ??
-      (manual && "Tailscale" in manual.kind ? "Tailscale" : "手动节点");
+      (manual && "Tailscale" in manual.kind ? "Tailscale" : manual && "Chain" in manual.kind ? "代理链" : "手动节点");
     const type =
       n?.proxy_type ??
       (manual && "Tailscale" in manual.kind
@@ -43,9 +44,10 @@ export function useNodeBrowser(members: NodeRef[]) {
               (manual.kind.Proxy.raw as Record<string, unknown>)?.type ??
                 "代理",
             )
-          : "代理");
-    const proxy = m ? proxyNameOf(m, ref) : null;
-    return { ref, name: m ? nodeLabel(m, ref) : "", source, type, proxy };
+          : manual && "Chain" in manual.kind ? "TCP · 2 跳" : "代理");
+    const unavailable = m && manual && "Chain" in manual.kind ? chainProblem(m, manual.kind.Chain) : undefined;
+    const proxy = m && !unavailable ? proxyNameOf(m, ref) : null;
+    return { ref, name: m ? nodeLabel(m, ref) : "", source, type, proxy, unavailable };
   });
   const filters = m ? candidateNodeGroups(m, members) : [];
   const activeFilter = filters.find((item) => item.id === filterGroup);
@@ -94,7 +96,7 @@ export function NodeBrowserToolbar({ browser }: { browser: NodeBrowserState }) {
         />
         <Button disabled={test.isPending} onClick={() => setSort(!sort)}>{sort ? "恢复默认排序" : "延迟排序"}</Button>
         <Button
-          disabled={test.isPending || !shown.length}
+          disabled={test.isPending || !shown.some((n) => n.proxy)}
           onClick={() => measure(shown.flatMap((n) => (n.proxy ? [n.proxy] : [])))}
         >
           {test.isPending ? "测量中…" : "测延迟"}
@@ -123,7 +125,8 @@ export function NodeBrowserGrid({
   onPick: (ref: NodeRef) => void;
 }) {
   const { shown, status, test, m, measure } = browser;
-  const tabKey = shown.some((n) => nodeKey(n.ref) === chosenKey) ? chosenKey : shown[0] ? nodeKey(shown[0].ref) : null;
+  const selectable = shown.filter((n) => !n.unavailable);
+  const tabKey = selectable.some((n) => nodeKey(n.ref) === chosenKey) ? chosenKey : selectable[0] ? nodeKey(selectable[0].ref) : null;
   const navigate = (e: KeyboardEvent<HTMLButtonElement>) => {
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
     const grid = e.currentTarget.closest('[role="radiogroup"]');
@@ -149,7 +152,8 @@ export function NodeBrowserGrid({
             gridKey={key}
             name={n.name} source={n.source} protocol={n.type} delay={delay}
             selected={key === chosenKey} current={key === currentKey}
-            disabled={disabled}
+            disabled={disabled || !!n.unavailable}
+            status={n.unavailable ? <Typography variant="caption" color="warning.main">{n.unavailable}</Typography> : undefined}
             selectionTabIndex={key === tabKey ? 0 : -1}
             onSelectionKeyDown={navigate}
             running={status.data?.core === "Running"}

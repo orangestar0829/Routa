@@ -40,10 +40,12 @@ import { TailscaleStateChip } from "../components/TailscaleState";
 import { useInterface } from "../components/InterfaceProvider";
 import { desktopApi, useDesktopMutation } from "../api/desktop";
 import { nodeKey, expandMembers } from "../lib/refs";
+import { chainProblem } from "../lib/proxyChain";
 import { clearMonitorFocus, useMonitorFocus } from "../api/monitorFocus";
 import { useSettingsSave, settingsSaveMessage } from "../api/settings";
 import { EMPTY_MONITOR_STATUS, fetchInUseNodes, skippedMessage, targetsForNode, withNode, withoutNode } from "../lib/monitor";
 import { ManualNodeDialog, newManualNode } from "./ManualNodeDialog";
+import { ProxyChainDialog } from "./ProxyChainDialog";
 import { NodeGroupDialog, newNodeGroup } from "./NodeGroupDialog";
 import { TailscaleDialog, newTailscaleNode } from "./TailscaleDialog";
 import { ListenerDialog, newListener } from "./ListenerDialog";
@@ -106,7 +108,8 @@ function NodeResources() {
   const [manual, setManual] = useState<ManualNode | null>(null),
     [ts, setTs] = useState<ManualNode | null>(null),
     [group, setGroup] = useState<NodeGroup | null>(null),
-    [proxy, setProxy] = useState<NodeRef | null>(null);
+    [proxy, setProxy] = useState<NodeRef | null>(null),
+    [chain, setChain] = useState<{ id: string; node?: ManualNode } | null>(null);
   const [deleting, setDeleting] = useState<{
     name: string;
     run: () => Promise<unknown>;
@@ -142,21 +145,23 @@ function NodeResources() {
         type: n.proxy_type,
         proxy: `${s.name}/${n.name}`,
         manual: undefined as ManualNode | undefined,
+        chainProblem: undefined as string | undefined,
       })),
     ),
     ...m.manual_nodes.map((n) => ({
       ref: { manual_id: n.id } as NodeRef,
       name: n.name,
-      source: "Tailscale" in n.kind ? "Tailscale" : "手动节点",
+      source: "Tailscale" in n.kind ? "Tailscale" : "Chain" in n.kind ? "代理链" : "手动节点",
       sourceId: "",
       type:
         "Tailscale" in n.kind
           ? "Tailscale"
-          : String(
-              (n.kind.Proxy.raw as Record<string, unknown>)?.type ?? "代理",
-            ),
+          : "Chain" in n.kind
+            ? "TCP · 2 跳"
+            : String((n.kind.Proxy.raw as Record<string, unknown>)?.type ?? "代理"),
       proxy: `手动/${n.name}`,
       manual: n,
+      chainProblem: "Chain" in n.kind ? chainProblem(m, n.kind.Chain) : undefined,
     })),
   ];
   const memberships = new Map(
@@ -286,6 +291,7 @@ function NodeResources() {
                 transformOrigin={{ vertical: "top", horizontal: "right" }}
               >
                 <MenuItem onClick={create(() => setManual(newManualNode()))}>新增节点</MenuItem>
+                <MenuItem onClick={create(() => setChain({ id: crypto.randomUUID() }))}>新增代理链</MenuItem>
                 <MenuItem onClick={create(() => setTs(newTailscaleNode()))}>新增 Tailscale</MenuItem>
                 <MenuItem onClick={create(() => setBatch(true))}>导入 YAML</MenuItem>
                 <Divider />
@@ -308,11 +314,11 @@ function NodeResources() {
             <Button
               variant="outlined"
               startIcon={<NetworkCheck />}
-              disabled={test.isPending}
+              disabled={test.isPending || !nodes.some((n) => (!source || n.sourceId === source) && !n.chainProblem)}
               onClick={() =>
                 test.mutate(
                   nodes
-                    .filter((n) => !source || n.sourceId === source)
+                    .filter((n) => (!source || n.sourceId === source) && !n.chainProblem)
                     .map((n) => n.proxy),
                 )
               }
@@ -408,16 +414,18 @@ function NodeResources() {
                               name={n.name}
                               source={n.source}
                               protocol={n.type}
-                              delay={st.delays[n.proxy]}
+                              delay={n.chainProblem ? undefined : st.delays[n.proxy]}
                               gridKey={nodeKey(n.ref)}
-                              testTarget={n.proxy}
+                              testTarget={n.chainProblem ? undefined : n.proxy}
                               testUrl={m.settings.delay_test_url}
                               running={st.core === "Running"}
-                              pending={test.waiting(n.proxy, st.delays[n.proxy])}
+                              pending={!n.chainProblem && test.waiting(n.proxy, st.delays[n.proxy])}
                               monitorFocus={!!highlight?.lit && highlight.key === nodeKey(n.ref)}
                               status={
                                 // One mark slot: a down node outranks the Tailscale state.
-                                mt.some((t) => t.down) ? (
+                                n.chainProblem ? (
+                                  <Chip size="small" color="warning" label={n.chainProblem} />
+                                ) : mt.some((t) => t.down) ? (
                                   <MonitorMark targets={mt} />
                                 ) : n.manual && "Tailscale" in n.manual.kind ? (
                                   <TailscaleStateChip node={n.manual} compact />
@@ -428,6 +436,7 @@ function NodeResources() {
                               actions={[
                                 {
                                   label: simple ? "使用此节点" : "用于新代理",
+                                  disabled: !!n.chainProblem,
                                   onClick: () =>
                                     simple
                                       ? choose.mutate(n.ref)
@@ -435,7 +444,7 @@ function NodeResources() {
                                 },
                                 {
                                   label: "测延迟",
-                                  disabled: test.isPending,
+                                  disabled: test.isPending || !!n.chainProblem,
                                   onClick: () => test.mutate([n.proxy]),
                                 },
                                 ...(n.manual
@@ -448,7 +457,9 @@ function NodeResources() {
                                         onClick: () =>
                                           "Tailscale" in n.manual!.kind
                                             ? setTs(n.manual!)
-                                            : setManual(n.manual!),
+                                            : "Chain" in n.manual!.kind
+                                              ? setChain({ id: n.manual!.id, node: n.manual! })
+                                              : setManual(n.manual!),
                                       },
                                       {
                                         label: "删除",
@@ -510,6 +521,7 @@ function NodeResources() {
           onClose={() => setManual(null)}
         />
       )}
+      {chain && <ProxyChainDialog key={chain.id} {...chain} onClose={() => setChain(null)} />}
       {ts && (
         <TailscaleDialog key={ts.id} node={ts} onClose={() => setTs(null)} />
       )}

@@ -159,14 +159,26 @@ pub mod ops {
     }
 
     pub async fn save_manual_node(rt: &Runtime, n: ManualNode) -> CmdResult {
-        rt.mutate(|m| {
+        rt.mutate_with(|m| {
+            if let ManualNodeKind::Chain { entry, exit } = &n.kind {
+                if entry == exit || [entry, exit].into_iter()
+                    .any(|r| crate::model::resolve::resolve_chain_hop(m, r).is_none())
+                {
+                    return Err(vec![ValidationError::InvalidProxy {
+                        name: n.name.clone(),
+                        reason: "请选择两个不同、可用的普通 TCP 代理节点，不支持嵌套".into(),
+                    }]);
+                }
+            }
             let id = n.id.clone();
             for g in &mut m.node_groups {
                 g.members.retain(|r| r != &NodeRef::Manual { manual_id: id.clone() });
             }
-            upsert(&mut m.manual_nodes, n, |x| x.id == id)
+            upsert(&mut m.manual_nodes, n, |x| x.id == id);
+            Ok(())
         })
         .await
+        .map(|(outcome, ())| outcome)
     }
 
     /// Rejected with `DanglingRef` while an exit references the node. A
@@ -318,9 +330,18 @@ pub mod ops {
         items.into_iter().map(|item| parse_proxy_yaml(serde_json::to_string(&item).map_err(|e| e.to_string())?)).collect()
     }
     pub async fn save_manual_nodes(rt: &Runtime, nodes: Vec<ManualNode>) -> CmdResult {
-        rt.mutate(|m| {
+        rt.mutate_with(|m| {
+            if let Some(node) = nodes.iter().find(|n| {
+                matches!(n.kind, ManualNodeKind::Chain { .. })
+                    || crate::model::resolve::is_chain_ref(m, &NodeRef::Manual { manual_id: n.id.clone() })
+            }) {
+                return Err(vec![ValidationError::InvalidProxy {
+                    name: node.name.clone(), reason: "请通过代理链编辑窗口保存".into(),
+                }]);
+            }
             for n in nodes { let id = n.id.clone(); upsert(&mut m.manual_nodes, n, |x| x.id == id); }
-        }).await
+            Ok(())
+        }).await.map(|(outcome, ())| outcome)
     }
 
     /// Parses the first non-empty line of `text` as a share link
@@ -333,7 +354,7 @@ pub mod ops {
     }
 
     /// Keys a pasted proxy must not carry: the exit decides the interface,
-    /// and chaining through other proxies is not supported.
+    /// and only a typed proxy chain can configure a dialer-proxy.
     const STRIPPED_KEYS: [&str; 3] = ["interface-name", "routing-mark", "dialer-proxy"];
 
     /// Parses one pasted mihomo proxy: a mapping, or a one-element sequence
@@ -357,11 +378,13 @@ pub mod ops {
                 return Err(format!("节点缺少 {key}"));
             }
         }
-        let stripped = STRIPPED_KEYS
-            .iter()
-            .filter(|k| map.remove(**k).is_some())
-            .map(|k| k.to_string())
-            .collect();
+        let mut stripped = Vec::new();
+        for protected in STRIPPED_KEYS {
+            stripped.extend(map.keys().filter(|key| crate::config_gen::proxy_option_matches(key, protected)).cloned());
+        }
+        for key in &stripped {
+            map.remove(key);
+        }
         Ok(ParsedProxy { raw: Value::Object(map), stripped })
     }
 }
@@ -370,8 +393,8 @@ pub mod ops {
 #[derive(Serialize, Clone, Debug, PartialEq, specta::Type)]
 pub struct ParsedProxy {
     pub raw: serde_json::Value,
-    /// Keys removed from the paste, a subset of
-    /// `["interface-name", "routing-mark", "dialer-proxy"]` in that order.
+    /// Keys removed from the paste, grouped by `interface-name`,
+    /// `routing-mark`, and `dialer-proxy`, including alternate spellings.
     pub stripped: Vec<String>,
 }
 
@@ -1145,6 +1168,11 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(p.stripped, vec!["interface-name".to_string(), "routing-mark".to_string()]);
         assert_eq!(p.raw["port"], 2);
+        let p = ops::parse_proxy_yaml(
+            "{name: c, type: http, port: 80, Interface_Name: eth, routing_marK: 77, DIALER_PROXY: DIRECT}".into(),
+        ).unwrap();
+        assert_eq!(p.stripped, ["Interface_Name", "routing_marK", "DIALER_PROXY"].map(str::to_owned).to_vec());
+        assert_eq!(p.raw, serde_json::json!({"name": "c", "type": "http", "port": 80}));
         let ts = ops::parse_proxy_yaml("{name: t, type: tailscale}".into()).unwrap();
         assert_eq!(ts.raw["type"], "tailscale");
     }
@@ -1206,6 +1234,35 @@ pub(crate) mod tests {
         let errs = ops::delete_manual_node(&rt, n.id.clone()).await.unwrap_err();
         assert!(errs.iter().any(|e| matches!(e, ValidationError::DanglingRef { .. })), "{errs:?}");
         assert_eq!(rt.model(), before, "nothing changed");
+    }
+
+    #[tokio::test]
+    async fn save_chain_validates_hops_and_updates_without_changing_port_reference() {
+        let td = tempfile::tempdir().unwrap();
+        let rt = runtime(&td);
+        let hop1 = proxy_node("first", vec![]);
+        let hop2 = proxy_node("last", vec![]);
+        let hop3 = proxy_node("alternate last", vec![]);
+        let mut chain = ManualNode {
+            id: ManualNodeId::new(), name: "chain".into(), groups: vec![],
+            kind: ManualNodeKind::Chain { entry: mref(&hop1), exit: mref(&hop2) },
+        };
+        assert!(ops::save_manual_node(&rt, chain.clone()).await.is_err(), "missing hops");
+        for hop in [&hop1, &hop2, &hop3] {
+            ops::save_manual_node(&rt, hop.clone()).await.unwrap();
+        }
+        ops::save_manual_node(&rt, chain.clone()).await.unwrap();
+        let exit = Exit { id: ExitId::new(), name: "port-outbound".into(), kind: ExitKind::Node { node: mref(&chain) }, interface: None, hidden: false };
+        ops::save_exit(&rt, exit.clone()).await.unwrap();
+        assert!(ops::delete_manual_node(&rt, hop2.id.clone()).await.is_err(), "still in use");
+
+        chain.name = "renamed chain".into();
+        chain.kind = ManualNodeKind::Chain { entry: mref(&hop1), exit: mref(&hop3) };
+        assert!(ops::save_manual_nodes(&rt, vec![chain.clone()]).await.is_err(), "not a pasted node");
+        ops::save_manual_node(&rt, chain.clone()).await.unwrap();
+        assert_eq!(rt.model().exits, vec![exit]);
+        assert!(rt.model().manual_nodes.contains(&chain));
+        ops::delete_manual_node(&rt, hop2.id).await.unwrap();
     }
 
     #[tokio::test]
