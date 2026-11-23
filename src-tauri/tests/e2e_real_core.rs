@@ -3,7 +3,7 @@
 //! Run: MIHOMO_BIN=<path to mihomo exe> cargo test --test e2e_real_core -- --ignored --nocapture
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv6Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -138,12 +138,63 @@ fn curl_status(proxy_port: u16, url: &str) -> String {
 
 fn curl_status_from(program: &Path, proxy_port: u16, url: &str) -> String {
     let out = Command::new(program)
-        .args(["-s", "-o", "NUL", "-w", "%{http_code}", "-m", "15", "--noproxy", "", "-x"])
+        .args(["-sS", "-o", "NUL", "-w", "%{http_code}", "-m", "15", "--noproxy", "", "-x"])
         .arg(format!("http://127.0.0.1:{proxy_port}"))
         .arg(url)
         .output()
         .expect("curl.exe");
+    if !out.status.success() {
+        eprintln!(
+            "{} through port {proxy_port} to {url}: exit {:?}; {}",
+            program.display(), out.status.code(), String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Exercise the real proxy with a protocol-level IPv6 destination, avoiding
+/// platform-specific URL parsing in curl while keeping the underlying fixture
+/// entirely on IPv4 loopback (the tagged upstream handles the destination).
+fn socks_ipv6_status(proxy_port: u16, destination: Ipv6Addr) -> io::Result<String> {
+    let mut tcp = TcpStream::connect(("127.0.0.1", proxy_port))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
+    tcp.write_all(&[5, 1, 0])?;
+    let mut greeting = [0u8; 2];
+    tcp.read_exact(&mut greeting)?;
+    if greeting != [5, 0] {
+        return Err(io::Error::other(format!("SOCKS5 no-auth greeting rejected: {greeting:?}")));
+    }
+
+    let mut request = vec![5, 1, 0, 4]; // v5, CONNECT, reserved, ATYP IPv6
+    request.extend_from_slice(&destination.octets());
+    request.extend_from_slice(&80_u16.to_be_bytes());
+    tcp.write_all(&request)?;
+    let mut reply = [0u8; 4];
+    tcp.read_exact(&mut reply)?;
+    if reply[..3] != [5, 0, 0] {
+        return Err(io::Error::other(format!("SOCKS5 CONNECT to [{destination}]:80 failed: {reply:?}")));
+    }
+    let len = match reply[3] {
+        1 => 4,
+        4 => 16,
+        3 => {
+            let mut len = [0u8; 1];
+            tcp.read_exact(&mut len)?;
+            usize::from(len[0])
+        }
+        atyp => return Err(io::Error::other(format!("unexpected SOCKS5 reply ATYP {atyp}"))),
+    };
+    tcp.read_exact(&mut vec![0u8; len + 2])?; // BND.ADDR and BND.PORT
+    write!(tcp, "GET / HTTP/1.1\r\nHost: [{destination}]\r\nConnection: close\r\n\r\n")?;
+    let mut status_line = String::new();
+    BufReader::new(tcp).read_line(&mut status_line)?;
+    let mut fields = status_line.split_ascii_whitespace();
+    if !fields.next().is_some_and(|version| version.starts_with("HTTP/1.")) {
+        return Err(io::Error::other(format!("invalid tagged HTTP response: {status_line:?}")));
+    }
+    fields.next().map(str::to_owned)
+        .ok_or_else(|| io::Error::other(format!("missing HTTP status: {status_line:?}")))
 }
 
 fn test_http_node(name: &str, port: u16) -> ManualNode {
@@ -403,11 +454,15 @@ async fn real_core_two_listeners_direct_exit() {
             },
             SharedRule {
                 enabled: true, matcher: RuleMatch::DomainKeyword, value: "routa-keyword".into(),
-                action: named_action,
+                action: named_action.clone(),
+            },
+            SharedRule {
+                enabled: true, matcher: RuleMatch::Ipv6Cidr, value: "2001:db8:1::/48".into(),
+                action: path_action.clone(),
             },
             SharedRule {
                 enabled: true, matcher: RuleMatch::Ipv6Cidr, value: "2001:db8::/32".into(),
-                action: path_action.clone(),
+                action: named_action,
             },
         ];
         m.listeners.iter_mut().find(|l| l.id == l1_id).unwrap().routing = Some(ListenerRouting {
@@ -425,10 +480,18 @@ async fn real_core_two_listeners_direct_exit() {
         curl_status_from(&named, p2, &test_url),
         curl_status(p1, &test_url),
         curl_status(p1, "http://api-routa-keyword.example.invalid/"),
-        curl_status(p1, "http://[2001:db8::1]/"),
     ]).await.unwrap();
-    assert_eq!(codes, ["201", "202", "204", "204", "201", "202"],
-        "name, path, isolated port, default, keyword, and IPv6 must take the expected destinations");
+    assert_eq!(codes, ["201", "202", "204", "204", "201"],
+        "name, path, isolated port, default, and keyword must take the expected destinations");
+    let (ipv6_inside, ipv6_outside) = tokio::task::spawn_blocking(move || {
+        let probe = |address: &str| {
+            socks_ipv6_status(p1, address.parse().unwrap())
+                .unwrap_or_else(|error| panic!("IPv6 SOCKS5 probe to [{address}] via {p1}: {error}"))
+        };
+        (probe("2001:db8:1::1"), probe("2001:db8:2::1"))
+    }).await.unwrap();
+    assert_eq!(ipv6_inside, "202", "narrow /48 must take its explicit target");
+    assert_eq!(ipv6_outside, "201", "neighboring IPv6 /48 must only match the broader /32 target");
 
     // 3. Disable listener 2 -> its port refuses connections; listener 1 still works.
     assert!(!refuses(p2));
