@@ -932,8 +932,10 @@ export type ProjectLink = "Website" | "GitHub"
  * Bytes per second.
  */
 export type Rate = { up: number; down: number }
-export type RuleAction = "Proxy" | "Direct" | "Reject"
-export type RuleMatch = "Domain" | "DomainSuffix" | "Ipv4Cidr" | "Geosite" | "Geoip" | "RuleSet"
+export type RuleAction = "Proxy" | "Direct" | "Reject" | { Target: { target: ExitMember; unavailable?: RuleUnavailable } }
+export type RuleMatch = "Domain" | "DomainSuffix" | "DomainKeyword" | "Ipv4Cidr" | "Ipv6Cidr" | "Geosite" | "Geoip" | "RuleSet" | "ProcessName" | "ProcessPath"
+
+export type RuleUnavailable = "Reject" | "Direct"
 
 export type RuleProviderBehavior = "Domain" | "IpCidr" | "Classical"
 

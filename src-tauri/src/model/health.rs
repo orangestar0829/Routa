@@ -40,7 +40,7 @@ pub struct Health {
     pub listeners: HashMap<ListenerId, ListenerStatus>,
 }
 
-fn exit_health(model: &Model, exit: &Exit, nics: &[NetInterface]) -> ExitHealth {
+pub(crate) fn exit_health(model: &Model, exit: &Exit, nics: &[NetInterface]) -> ExitHealth {
     let (effective_members, missing_members): (Vec<NodeRef>, Vec<ExitMember>) = match &exit.kind {
         ExitKind::Node { node } => {
             if resolve(model, node).is_some() {

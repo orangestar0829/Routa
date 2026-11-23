@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::model::health::{ExitHealth, ExitStatus, Health, ListenerStatus};
+use crate::model::health::{exit_health, ExitHealth, ExitStatus, Health, ListenerStatus};
 use crate::model::*;
 use crate::netif::NetInterface;
 
@@ -16,11 +16,30 @@ fn route_keyword(matcher: &RuleMatch) -> &'static str {
     match matcher {
         RuleMatch::Domain => "DOMAIN",
         RuleMatch::DomainSuffix => "DOMAIN-SUFFIX",
+        RuleMatch::DomainKeyword => "DOMAIN-KEYWORD",
         RuleMatch::Ipv4Cidr => "IP-CIDR",
+        RuleMatch::Ipv6Cidr => "IP-CIDR6",
+        RuleMatch::ProcessName => "PROCESS-NAME",
+        RuleMatch::ProcessPath => "PROCESS-PATH",
         RuleMatch::Geosite => "GEOSITE",
         RuleMatch::Geoip => "GEOIP",
         RuleMatch::RuleSet => "RULE-SET",
     }
+}
+
+fn advanced_rule(matcher: &RuleMatch, action: &RuleAction) -> bool {
+    matches!(matcher, RuleMatch::DomainKeyword | RuleMatch::Ipv6Cidr | RuleMatch::ProcessName | RuleMatch::ProcessPath)
+        || matches!(action, RuleAction::Target { .. })
+}
+
+fn listener_subrule_name(sub_rules: &Mapping, listener: &Listener, auxiliary: bool) -> Value {
+    if auxiliary {
+        let name = s(&format!("__aux_{}", listener.id.0));
+        if sub_rules.contains_key(&name) {
+            return name;
+        }
+    }
+    s(&format!("__port_{}", listener.id.0))
 }
 
 fn rule_provider_yaml(provider: &SharedRuleProvider) -> Value {
@@ -320,6 +339,35 @@ fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface])
     (!parts.proxies.is_empty() || !parts.shared.is_empty()).then_some(parts)
 }
 
+/// A rule target gets its own name and copies of its proxies for each port,
+/// so it inherits that port's interface instead of using the global node copy.
+fn rule_target_parts(input: &GenInput<'_>, port_exit: &Exit, alias: &str, target: &ExitMember) -> Option<ExitParts> {
+    let kind = match target {
+        ExitMember::Node(node) => ExitKind::Node { node: node.clone() },
+        ExitMember::Group { .. } => ExitKind::Group {
+            strategy: GroupStrategy::Fallback, members: vec![target.clone()], selected: None,
+        },
+    };
+    let exit = Exit {
+        id: ExitId(alias.into()),
+        name: alias.into(),
+        kind,
+        interface: port_exit.interface.clone(),
+        hidden: true,
+    };
+    let mut health = exit_health(input.model, &exit, input.nics);
+    if health.status != ExitStatus::Ok {
+        return None;
+    }
+    // A Tailscale instance has its own NIC and cannot honor a conflicting
+    // port pin. Match the same exact NIC policy as normal port exits.
+    health.effective_members.retain(|r| match resolve(input.model, r) {
+        Some(Resolved::Tailscale { opts, .. }) => opts.interface == port_exit.interface,
+        _ => true,
+    });
+    exit_parts(input.model, &exit, &health, input.nics)
+}
+
 fn hash_yaml(v: &Value) -> u64 {
     let text = serde_yaml_ng::to_string(v).expect("yaml serialization");
     let mut hasher = DefaultHasher::new();
@@ -476,6 +524,7 @@ pub fn generate(input: &GenInput) -> Generated {
         .map(|provider| (provider.name.as_str(), rule_provider_yaml(provider)))
         .collect();
     let mut used_providers = BTreeSet::new();
+    let mut find_process = false;
     let mut listeners = Vec::new();
     let mut plan = BTreeMap::new();
     for l in &model.listeners {
@@ -514,14 +563,23 @@ pub fn generate(input: &GenInput) -> Generated {
             let mut direct = vec![("name", s(&direct_alias)), ("type", s("direct"))];
             if let Some(nic) = input.health.exits.get(&exit.id).and_then(|h| h.interface.as_ref()) { direct.push(("interface-name", s(&nic.mihomo_name))); }
             proxies.push(map(direct));
-            let action = |a: &RuleAction| match a { RuleAction::Proxy => target_alias.as_str(), RuleAction::Direct => direct_alias.as_str(), RuleAction::Reject => "REJECT" };
+            let basic_action = |a: &RuleAction| match a {
+                RuleAction::Proxy => target_alias.as_str(),
+                RuleAction::Direct => direct_alias.as_str(),
+                RuleAction::Reject | RuleAction::Target { .. } => "REJECT",
+            };
 
             let local = l.routing.iter().flat_map(|routing| routing.rules.iter())
                 .map(|rule| (&rule.matcher, rule.value.as_str(), &rule.action));
             let shared = inherited.iter().copied()
                 .map(|rule| (&rule.matcher, rule.value.as_str(), &rule.action));
             let mut effective_providers = Mapping::new();
-            let mut rules: Vec<Value> = local.chain(shared).map(|(matcher, value, r_action)| {
+            let mut effective_targets = Mapping::new();
+            let mut has_target_action = false;
+            let mut rules = Vec::new();
+            let mut auxiliary_rules = Vec::new();
+            let mut has_advanced_rule = false;
+            for (index, (matcher, value, r_action)) in local.chain(shared).enumerate() {
                 if *matcher == RuleMatch::RuleSet {
                     if let Some(provider) = provider_config.get(value) {
                         used_providers.insert(value);
@@ -530,12 +588,70 @@ pub fn generate(input: &GenInput) -> Generated {
                     // An invalid reference in manually edited persisted JSON
                     // must be rejected by the core, not silently skipped.
                 }
-                s(&format!("{},{},{}", route_keyword(matcher), value, action(r_action)))
-            }).collect();
+                if matches!(matcher, RuleMatch::ProcessName | RuleMatch::ProcessPath) {
+                    find_process = true;
+                }
+                let mut guard_unsupported_transport = false;
+                let target_name = if let RuleAction::Target { target, unavailable } = r_action {
+                    has_target_action = true;
+                    let route_alias = format!("__rule_target_{}_{index}", l.id.0);
+                    if let Some(parts) = rule_target_parts(input, exit, &route_alias, target) {
+                        effective_targets.insert(s(&route_alias), Value::from(fingerprint(&parts)));
+                        proxies.extend(parts.proxies);
+                        groups.extend(parts.group);
+                        guard_unsupported_transport = true;
+                        route_alias
+                    } else {
+                        match unavailable {
+                            RuleUnavailable::Reject => "REJECT".to_owned(),
+                            RuleUnavailable::Direct => direct_alias.clone(),
+                        }
+                    }
+                } else {
+                    basic_action(r_action).to_owned()
+                };
+                let resolved_value;
+                let value = if *matcher == RuleMatch::ProcessPath {
+                    resolved_value = crate::model::normalize::normalize_exe_path(value);
+                    resolved_value.as_str()
+                } else {
+                    value
+                };
+                let keyword = route_keyword(matcher);
+                let line = s(&format!("{keyword},{value},{target_name}"));
+                if advanced_rule(matcher, r_action) {
+                    has_advanced_rule = true;
+                } else {
+                    auxiliary_rules.push(line.clone());
+                }
+                rules.push(line);
+                // mihomo skips a matched outbound that cannot transport UDP.
+                // Never let an explicit node/group selection fall through to
+                // a broader or direct rule for that same traffic.
+                if guard_unsupported_transport {
+                    rules.push(s(&format!("{keyword},{value},REJECT")));
+                }
+            }
             let unmatched = l.routing.as_ref().map_or(&RuleAction::Proxy, |routing| &routing.unmatched);
-            rules.push(s(&format!("MATCH,{}", action(unmatched))));
-            if !inherited.is_empty() {
+            let fallback = s(&format!("MATCH,{}", basic_action(unmatched)));
+            rules.push(fallback.clone());
+            if has_target_action && *unmatched == RuleAction::Proxy {
+                // A TCP-only port default may also be skipped; do not let
+                // mihomo fall back to its unbound built-in DIRECT route.
+                rules.push(s("MATCH,REJECT"));
+            }
+            if has_advanced_rule && l.routing.is_some() {
+                // TUN and subscription refresh historically borrow the local
+                // port's rule list. Keep legacy rules for them, but do not let
+                // newly added app/target rules silently change that traffic.
+                auxiliary_rules.push(fallback);
+                sub_rules.insert(s(&format!("__aux_{}", l.id.0)), Value::Sequence(auxiliary_rules));
+            }
+            if !inherited.is_empty() || has_target_action {
                 fingerprint_fields.push(("effective-rules", Value::Sequence(rules.clone())));
+            }
+            if !effective_targets.is_empty() {
+                fingerprint_fields.push(("effective-targets", Value::Mapping(effective_targets)));
             }
             if !effective_providers.is_empty() {
                 fingerprint_fields.push(("effective-providers", Value::Mapping(effective_providers)));
@@ -569,8 +685,13 @@ pub fn generate(input: &GenInput) -> Generated {
         let Some(exit) = model.exits.iter().find(|e| &e.id == exit_id) else {
             continue;
         };
-        let routed = model.listeners.iter().find(|l| l.exit.as_ref() == Some(exit_id) && l.routing.is_some());
-        let destination = routed.map(|l| ("rule", s(&format!("__port_{}", l.id.0)))).filter(|(_, name)| sub_rules.contains_key(name)).unwrap_or(("proxy", s(&exit.name)));
+        let routed = model.listeners.iter().find(|l| {
+            l.exit.as_ref() == Some(exit_id) && l.routing.is_some()
+                && selected.is_none_or(|id| &l.id == id)
+                && sub_rules.contains_key(&listener_subrule_name(&sub_rules, l, true))
+        });
+        let destination = routed.map(|l| ("rule", listener_subrule_name(&sub_rules, l, true)))
+            .unwrap_or(("proxy", s(&exit.name)));
         listeners.push(map(vec![
             ("name", s(&format!("__fetch__{}", exit_id.0))),
             ("type", s("mixed")),
@@ -582,6 +703,7 @@ pub fn generate(input: &GenInput) -> Generated {
 
     let mut root: Value = serde_yaml_ng::from_str(&base_config(model.settings.controller_port, input.secret, proxies, groups, listeners)).expect("generated config");
     if !sub_rules.is_empty() { root["sub-rules"] = Value::Mapping(sub_rules); }
+    if find_process { root["find-process-mode"] = s("strict"); }
     if !used_providers.is_empty() {
         root["rule-providers"] = Value::Mapping(used_providers.into_iter().map(|name| {
             (s(name), provider_config[name].clone())
@@ -625,7 +747,11 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
         ]));
     root["rules"] = Value::Sequence(vec![s("MATCH,__routa_tun__")]);
     if let Some(l) = input.model.listeners.iter().find(|l| l.exit.as_ref() == Some(id) && l.routing.is_some()) {
-        if let Some(rules) = root.get("sub-rules").and_then(|v| v.get(format!("__port_{}", l.id.0))).cloned() { root["rules"] = rules; }
+        if let Some(rules) = root.get("sub-rules").and_then(Value::as_mapping)
+            .and_then(|sets| sets.get(&listener_subrule_name(sets, l, true))).cloned()
+        {
+            root["rules"] = rules;
+        }
     }
     root["auto-detect-interface"] = Value::Bool(true);
     root["tun"] = map(vec![
@@ -916,6 +1042,118 @@ mod tests {
         m.listeners[0].hidden = true;
         let cfg = parse(&gen(&m).yaml);
         assert!(cfg.get("sub-rules").is_none());
+    }
+
+    fn target_action(target: ExitMember, unavailable: RuleUnavailable) -> RuleAction {
+        RuleAction::Target { target, unavailable }
+    }
+
+    #[test]
+    fn extended_matchers_render_and_targets_preserve_port_isolation() {
+        let mut m = base();
+        let subscription = m.subscriptions[0].id.clone();
+        m.listeners[0].inherit_shared_rules = true;
+        m.listeners[0].routing = Some(ListenerRouting {
+            rules: vec![PortRule {
+                matcher: RuleMatch::ProcessPath,
+                value: "C:/Program Files/Tools/probe.exe".into(),
+                action: target_action(ExitMember::Node(nref("HK 01")), RuleUnavailable::Reject),
+            }],
+            unmatched: RuleAction::Proxy,
+        });
+        m.shared_rules = vec![
+            SharedRule { enabled: true, matcher: RuleMatch::ProcessName, value: "browser.exe".into(),
+                action: target_action(ExitMember::Group { group: GroupRef::Subscription(subscription) }, RuleUnavailable::Reject) },
+            SharedRule { enabled: true, matcher: RuleMatch::Ipv6Cidr, value: "2001:db8::/32".into(), action: RuleAction::Reject },
+            SharedRule { enabled: true, matcher: RuleMatch::DomainKeyword, value: "example".into(), action: RuleAction::Direct },
+        ];
+        let out = gen(&m);
+        let cfg = parse(&out.yaml);
+        assert_eq!(cfg["find-process-mode"], "strict");
+        assert_eq!(cfg["sub-rules"]["__port_la"], serde_yaml_ng::to_value([
+            r"PROCESS-PATH,C:\Program Files\Tools\probe.exe,__rule_target_la_0",
+            r"PROCESS-PATH,C:\Program Files\Tools\probe.exe,REJECT",
+            "PROCESS-NAME,browser.exe,__rule_target_la_1",
+            "PROCESS-NAME,browser.exe,REJECT",
+            "IP-CIDR6,2001:db8::/32,REJECT",
+            "DOMAIN-KEYWORD,example,__direct_la",
+            "MATCH,__target_la",
+            "MATCH,REJECT",
+        ]).unwrap());
+        assert_eq!(find(&cfg, "proxies", "__rule_target_la_0").unwrap()["interface-name"], "以太网");
+        let group = find(&cfg, "proxy-groups", "__rule_target_la_1").unwrap();
+        assert_eq!(group["type"], "fallback");
+        assert_eq!(group["proxies"].as_sequence().unwrap().len(), 2);
+        assert_eq!(cfg["listeners"][1]["proxy"], "出口B");
+
+        // A selected node changing underneath an unchanged rule must cut only
+        // connections on that listener (not other listeners with no dependency).
+        m.subscriptions[0].nodes[0].raw["server"] = serde_json::json!("changed.example.com");
+        let updated = gen(&m);
+        assert_ne!(out.plan.listeners["入口A"].listener_fingerprint, updated.plan.listeners["入口A"].listener_fingerprint);
+        assert_eq!(out.plan.listeners["入口C"], updated.plan.listeners["入口C"]);
+    }
+
+    #[test]
+    fn advanced_port_rules_do_not_leak_to_subscription_refresh_or_tun() {
+        let mut m = base();
+        m.listeners[0].inherit_shared_rules = true;
+        m.listeners[0].routing = Some(ListenerRouting {
+            rules: vec![PortRule {
+                matcher: RuleMatch::DomainSuffix, value: "legacy.example".into(), action: RuleAction::Reject,
+            }],
+            unmatched: RuleAction::Proxy,
+        });
+        m.shared_rules = vec![
+            SharedRule { enabled: true, matcher: RuleMatch::Domain, value: "legacy-shared.example".into(), action: RuleAction::Direct },
+            SharedRule { enabled: true, matcher: RuleMatch::Domain, value: "selected.example".into(),
+                action: target_action(ExitMember::Node(nref("HK 01")), RuleUnavailable::Reject) },
+            SharedRule { enabled: true, matcher: RuleMatch::DomainKeyword, value: "extended".into(), action: RuleAction::Direct },
+        ];
+        m.subscriptions[0].fallback_listener = Some(m.listeners[0].id.clone());
+        m.subscriptions[0].fallback_exit = m.listeners[0].exit.clone();
+        let adapters = nics();
+        let health = evaluate(&m, &adapters);
+        let fetch = [(m.exits[0].id.clone(), 24000)];
+        let cfg = parse(&generate_for_capture(&GenInput {
+            model: &m, health: &health, secret: "test", fetch_listeners: &fetch, nics: &adapters,
+        }, Some(&m.exits[0].id)).yaml);
+        let legacy = serde_yaml_ng::to_value([
+            "DOMAIN-SUFFIX,legacy.example,REJECT",
+            "DOMAIN,legacy-shared.example,__direct_la",
+            "MATCH,__target_la",
+        ]).unwrap();
+        assert_eq!(cfg["sub-rules"]["__aux_la"], legacy);
+        assert_eq!(cfg["rules"], legacy);
+        assert_eq!(find(&cfg, "listeners", "__fetch__ea").unwrap()["rule"], "__aux_la");
+        assert_eq!(cfg["listeners"][0]["rule"], "__port_la");
+        assert_eq!(cfg["sub-rules"]["__port_la"][2], "DOMAIN,selected.example,__rule_target_la_2");
+        assert_eq!(cfg["sub-rules"]["__port_la"][3], "DOMAIN,selected.example,REJECT");
+    }
+
+    #[test]
+    fn target_missing_stays_blocked_unless_bound_direct_is_explicit() {
+        let mut m = base();
+        m.listeners[0].inherit_shared_rules = true;
+        m.shared_rules = vec![
+            SharedRule { enabled: true, matcher: RuleMatch::DomainKeyword, value: "blocked".into(),
+                action: target_action(ExitMember::Node(nref("removed-node")), RuleUnavailable::Reject) },
+            SharedRule { enabled: true, matcher: RuleMatch::DomainKeyword, value: "direct".into(),
+                action: target_action(ExitMember::Group { group: GroupRef::Custom(NodeGroupId("removed-group".into())) }, RuleUnavailable::Direct) },
+        ];
+        let out = gen(&m);
+        let yaml = parse(&out.yaml);
+        assert_eq!(yaml["sub-rules"]["__port_la"][0], "DOMAIN-KEYWORD,blocked,REJECT");
+        assert_eq!(yaml["sub-rules"]["__port_la"][1], "DOMAIN-KEYWORD,direct,__direct_la");
+        assert_eq!(find(&yaml, "proxies", "__direct_la").unwrap()["interface-name"], "以太网");
+        assert!(find(&yaml, "proxies", "__rule_target_la_0").is_none());
+        assert!(find(&yaml, "proxy-groups", "__rule_target_la_1").is_none());
+        m.subscriptions[0].nodes.push(node(serde_json::json!(
+            {"name":"removed-node","type":"http","server":"test.example","port":8080}
+        )));
+        let recovered = gen(&m);
+        assert_eq!(parse(&recovered.yaml)["sub-rules"]["__port_la"][0], "DOMAIN-KEYWORD,blocked,__rule_target_la_0");
+        assert_ne!(recovered.plan.listeners["入口A"].listener_fingerprint, out.plan.listeners["入口A"].listener_fingerprint);
     }
 
     #[test]

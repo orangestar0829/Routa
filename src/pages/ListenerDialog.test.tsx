@@ -122,6 +122,64 @@ describe("ListenerDialog V4.3", () => {
     expect(screen.getByText("共享规则的 GEOSITE 由内核匹配，此处无法离线验证。")).toBeInTheDocument();
     expect(screen.queryByText(/未匹配规则 →/)).not.toBeInTheDocument();
   });
+  it("saves an explicit IPv6 rule outlet while leaving unmatched options unchanged", async () => {
+    vi.mocked(commands.getModel).mockResolvedValue({
+      ...model,
+      manual_nodes: [
+        { id: "main", name: "默认节点", groups: [], kind: { Proxy: { raw: {} } } },
+        { id: "p2", name: "独立节点", groups: [], kind: { Proxy: { raw: {} } } },
+      ],
+    });
+    renderDialog(listener);
+    await modelLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "规则分流" }));
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "节点" }));
+    fireEvent.click(await screen.findByRole("option", { name: "默认节点" }));
+    fireEvent.click(screen.getByRole("button", { name: "添加规则" }));
+    const choose = (label: string, option: string) => {
+      fireEvent.mouseDown(screen.getByRole("combobox", { name: label }));
+      fireEvent.click(screen.getByRole("option", { name: option }));
+    };
+    choose("匹配类型", "IPv6 CIDR");
+    fireEvent.change(screen.getByLabelText("匹配内容"), { target: { value: "2001:db8::/32" } });
+    choose("处理方式", "指定节点或组");
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    expect(screen.getByText("第 1 条端口规则：请选择指定的节点或组")).toBeInTheDocument();
+    expect(invoke).not.toHaveBeenCalled();
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "所选出口" }));
+    fireEvent.click(await screen.findByRole("option", { name: "独立节点" }));
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "未匹配去向" }));
+    expect(screen.queryByRole("option", { name: "指定节点或组" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "阻断" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith(
+      "save_proxy",
+      expect.objectContaining({
+        target: expect.objectContaining({ kind: { Node: { node: { manual_id: "main" } } } }),
+        l: expect.objectContaining({ routing: {
+          unmatched: "Reject",
+          rules: [{ matcher: "Ipv6Cidr", value: "2001:db8::/32", action: {
+            Target: { target: { manual_id: "p2" }, unavailable: "Reject" },
+          } }],
+        } }),
+      }),
+    ));
+  });
+  it("does not infer fallback when an earlier process rule needs live metadata", async () => {
+    renderDialog({ ...listener, routing: {
+      rules: [
+        { matcher: "ProcessName", value: "Example.exe", action: "Reject" },
+        { matcher: "DomainKeyword", value: "example", action: "Direct" },
+      ],
+      unmatched: "Proxy",
+    } });
+    await modelLoaded();
+    fireEvent.click(screen.getByText("验证规则"));
+    fireEvent.change(screen.getByLabelText("域名或 IPv4 地址"), { target: { value: "www.example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "验证" }));
+    expect(screen.getByText("端口规则的 进程名 由内核匹配，此处无法离线验证。")).toBeInTheDocument();
+    expect(screen.queryByText(/未匹配规则 →/)).not.toBeInTheDocument();
+  });
   it("commits listener and private destination together without navigation", async () => {
     const close = renderDialog(listener);
     await modelLoaded();

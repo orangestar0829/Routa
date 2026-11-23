@@ -15,14 +15,17 @@ import { errorMessage, isValidationError, useModel, useSaveSharedRouting, valida
 import type { RuleAction, RuleMatch, SharedRule, SharedRuleProvider } from "../bindings";
 import { EmptyState } from "../components/EmptyState";
 import { FormDialog } from "../components/FormDialog";
+import { RouteActionFields } from "../components/RouteActionFields";
 import { useApplyResult } from "../components/ApplyResultSnackbar";
 import { applyOutcomeMessages } from "../lib/format";
 import { visibleListeners } from "../lib/hidden";
 import {
   ACTION_LABELS, MAINLAND_DIRECT, MATCH_LABELS, PROVIDER_BEHAVIORS, PROVIDER_FORMATS,
-  RULE_ACTIONS, RULE_MATCHERS, RULE_VALUE_EXAMPLES,
+  RULE_MATCHERS, RULE_VALUE_EXAMPLES, completeRuleAction, ruleActionLabel, ruleMatcherHint,
+  sameRuleAction, targetUnavailable, type DraftRuleAction,
 } from "../lib/sharedRouting";
 
+type DraftRule = Omit<SharedRule, "action"> & { action: DraftRuleAction };
 type RuleRow = { id: number; rule: SharedRule };
 type Draft = { rules: RuleRow[]; providers: SharedRuleProvider[] };
 
@@ -30,7 +33,7 @@ const TEMPLATE: SharedRule = { enabled: true, matcher: "DomainSuffix", value: ""
 const PROVIDER_TEMPLATE: SharedRuleProvider = {
   name: "", url: "", behavior: "Classical", format: "Yaml", interval: 86400,
 };
-const actionColor = { Direct: "success", Proxy: "primary", Reject: "error" } as const;
+const actionColor = { Direct: "success", Proxy: "primary", Reject: "error", Target: "primary" } as const;
 const panelHeight = { height: "clamp(280px, calc(100dvh - 252px), 640px)", overflow: "auto", scrollbarGutter: "stable" };
 
 function Info({ text }: { text: string }) {
@@ -50,8 +53,9 @@ function RowButton({ label, children, onClick, disabled }: {
 function RuleEditor({ existing, providers, onSave, onClose }: {
   existing?: SharedRule; providers: SharedRuleProvider[]; onSave: (rule: SharedRule) => void; onClose: () => void;
 }) {
-  const [rule, setRule] = useState(existing ?? TEMPLATE);
+  const [rule, setRule] = useState<DraftRule>(existing ?? TEMPLATE);
   const [err, setErr] = useState<string>();
+  const [targetErr, setTargetErr] = useState<string>();
   const missingProvider = rule.matcher === "RuleSet" && !providers.some((p) => p.name === rule.value);
   const save = () => {
     const value = rule.value.trim();
@@ -63,7 +67,11 @@ function RuleEditor({ existing, providers, onSave, onClose }: {
       setErr("请选择已导入的规则集");
       return;
     }
-    onSave({ ...rule, value });
+    if (!completeRuleAction(rule.action)) {
+      setTargetErr("请选择节点或组");
+      return;
+    }
+    onSave({ ...rule, value, action: rule.action });
   };
 
   return <FormDialog fullWidth maxWidth="xs" onClose={onClose} aria-labelledby="shared-rule-title">
@@ -87,12 +95,10 @@ function RuleEditor({ existing, providers, onSave, onClose }: {
           </TextField>
         ) : (
           <TextField label="匹配内容" value={rule.value} placeholder={RULE_VALUE_EXAMPLES[rule.matcher]}
-            error={!!err} helperText={err} onChange={(e) => { setRule({ ...rule, value: e.target.value }); setErr(undefined); }} />
+            error={!!err} helperText={err ?? ruleMatcherHint(rule.matcher)} onChange={(e) => { setRule({ ...rule, value: e.target.value }); setErr(undefined); }} />
         )}
-        <TextField select label="处理方式" value={rule.action}
-          onChange={(e) => setRule({ ...rule, action: e.target.value as RuleAction })}>
-          {RULE_ACTIONS.map(([value, label]) => <MenuItem key={value} value={value}>{label}</MenuItem>)}
-        </TextField>
+        <RouteActionFields action={rule.action} error={targetErr}
+          onChange={(action) => { setRule({ ...rule, action }); setTargetErr(undefined); }} />
         <FormControlLabel label="启用规则" control={<Switch checked={rule.enabled}
           onChange={(_, enabled) => setRule({ ...rule, enabled })} />} />
       </Stack>
@@ -111,8 +117,8 @@ function ProviderEditor({ existing, providers, onSave, onClose }: {
   const [provider, setProvider] = useState(existing ?? PROVIDER_TEMPLATE);
   const [interval, setInterval] = useState(String(provider.interval));
   const [attach, setAttach] = useState(!existing);
-  const [action, setAction] = useState<RuleAction>("Proxy");
-  const [errs, setErrs] = useState<{ name?: string; url?: string; interval?: string }>({});
+  const [action, setAction] = useState<DraftRuleAction>("Proxy");
+  const [errs, setErrs] = useState<{ name?: string; url?: string; interval?: string; target?: string }>({});
   const invalidFormat = provider.format === "Mrs" && provider.behavior === "Classical";
   const submit = () => {
     const name = provider.name.trim(), url = provider.url.trim(), seconds = Number(interval);
@@ -124,9 +130,14 @@ function ProviderEditor({ existing, providers, onSave, onClose }: {
       if (!["https:", "http:"].includes(address.protocol) || !address.hostname || address.username || address.password || url.includes("#")) throw new Error();
     } catch { next.url = "输入不含凭据或片段的 HTTP(S) 地址"; }
     if (!interval.trim() || !Number.isInteger(seconds) || seconds < 60 || seconds > 31536000) next.interval = "刷新间隔须为 60–31536000 秒";
+    let importedAction: RuleAction | undefined;
+    if (attach) {
+      if (completeRuleAction(action)) importedAction = action;
+      else next.target = "请选择节点或组";
+    }
     setErrs(next);
     if (Object.keys(next).length || invalidFormat) return;
-    onSave({ ...provider, name, url, interval: seconds }, attach ? action : undefined);
+    onSave({ ...provider, name, url, interval: seconds }, importedAction);
   };
 
   return <FormDialog fullWidth maxWidth="xs" onClose={onClose} aria-labelledby="shared-provider-title">
@@ -154,10 +165,8 @@ function ProviderEditor({ existing, providers, onSave, onClose }: {
         {!existing && <>
           <FormControlLabel label="同时添加共享规则" control={<Checkbox checked={attach}
             onChange={(_, checked) => setAttach(checked)} />} />
-          <TextField select label="处理方式" value={action} disabled={!attach}
-            onChange={(e) => setAction(e.target.value as RuleAction)}>
-            {RULE_ACTIONS.map(([value, label]) => <MenuItem key={value} value={value}>{label}</MenuItem>)}
-          </TextField>
+          <RouteActionFields action={action} disabled={!attach} error={attach ? errs.target : undefined}
+            onChange={(next) => { setAction(next); setErrs({ ...errs, target: undefined }); }} />
         </>}
       </Stack>
     </DialogContent>
@@ -176,7 +185,7 @@ function sameConfig(rules: SharedRule[], providers: SharedRuleProvider[], savedR
   return rules.length === savedRules.length && providers.length === savedProviders.length
     && rules.every((r, i) => {
       const saved = savedRules[i];
-      return r.matcher === saved.matcher && r.value === saved.value && r.action === saved.action && r.enabled === saved.enabled;
+      return r.matcher === saved.matcher && r.value === saved.value && sameRuleAction(r.action, saved.action) && r.enabled === saved.enabled;
     })
     && providers.every((p, i) => {
       const saved = savedProviders[i];
@@ -299,13 +308,23 @@ export function SharedRoutingPage() {
               </TableRow></TableHead>
               <TableBody>{rules.map(({ rule, id }, index) => {
                 const label = `第 ${index + 1} 条规则`;
+                const action = rule.action;
+                const actionLabel = ruleActionLabel(action, model.data);
                 return <TableRow key={id} hover>
                   <TableCell sx={{ color: "text.secondary", px: 1.5 }}>{index + 1}</TableCell>
                   <TableCell sx={{ overflowWrap: "anywhere" }}>
                     <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>{MATCH_LABELS[rule.matcher]}</Typography>
                     <Typography variant="body2" data-selectable="true">{rule.value || "—"}</Typography>
                   </TableCell>
-                  <TableCell><Chip size="small" variant="outlined" color={actionColor[rule.action]} label={ACTION_LABELS[rule.action]} /></TableCell>
+                  <TableCell>
+                    <Tooltip title={typeof action === "object" ? `指定出口：${actionLabel}` : ""}>
+                      <Chip size="small" variant="outlined" color={actionColor[typeof action === "string" ? action : "Target"]}
+                        label={actionLabel} sx={{ maxWidth: 156 }} />
+                    </Tooltip>
+                    {typeof action === "object" && <Typography variant="caption" color="text.secondary" sx={{ display: "block", whiteSpace: "nowrap" }}>
+                      不可用时{ACTION_LABELS[targetUnavailable(action)]}
+                    </Typography>}
+                  </TableCell>
                   <TableCell><Switch size="small" checked={rule.enabled} disabled={locked}
                     slotProps={{ input: { "aria-label": `启用${label}` } }}
                     onChange={(_, enabled) => update({ providers, rules: rules.map((r) => r.id === id ? { id, rule: { ...rule, enabled } } : r) })} /></TableCell>

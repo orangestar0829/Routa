@@ -79,7 +79,9 @@ const expression = (fn, ...args) => `(${fn.toString()})(...${JSON.stringify(args
 function locate(selector, label, partial, input, operation) {
   const normalize = (value) => (value ?? "").replace(/\s+/g, " ").trim();
   for (const match of document.querySelectorAll(selector)) {
-    const names = [match.innerText, match.textContent, match.getAttribute("aria-label")].map(normalize);
+    const labelledBy = (match.getAttribute("aria-labelledby") ?? "").split(/\s+/)
+      .map((id) => document.getElementById(id)?.textContent);
+    const names = [match.innerText, match.textContent, match.getAttribute("aria-label"), ...labelledBy].map(normalize);
     if (label && !names.some((name) => partial ? name.includes(label) : name === label)) continue;
     const el = input ? (match.control || match.querySelector("input")) : match;
     if (!el || el.disabled || el.getAttribute("aria-disabled") === "true" ||
@@ -87,7 +89,7 @@ function locate(selector, label, partial, input, operation) {
     el.scrollIntoView({ block: "center", inline: "nearest" });
     if (operation === "click") el.click();
     if (operation === "focus") el.focus();
-    return { checked: el.checked ?? null, value: el.value ?? null,
+    return { checked: el.checked ?? null, value: el.value ?? null, text: normalize(el.innerText),
       pressed: el.getAttribute("aria-pressed") === "true" };
   }
   return null;
@@ -115,6 +117,64 @@ async function fill(label, value) {
   await call("Input.insertText", { text: value });
   await wait(label + " input", () => evaluate(expression((expected) =>
     document.activeElement?.value === expected, value)));
+}
+
+async function chooseDialogOption(label, value) {
+  const select = '[role=dialog] [role=combobox]';
+  await find(select, label, { operation: "focus" });
+  // MUI's non-native select opens on keydown/mousedown, not DOM click.
+  const key = { key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40 };
+  await call("Input.dispatchKeyEvent", { type: "rawKeyDown", ...key });
+  await call("Input.dispatchKeyEvent", { type: "keyUp", ...key });
+  await click('[role=option]', value);
+  await wait(`${label} = ${value}`, async () => (await evaluate(
+    expression(locate, select, label, false, false),
+  ))?.text === value);
+}
+
+async function addLoopbackNode(name, port) {
+  await click('button[aria-haspopup="menu"]', "新增");
+  await click('[role=menuitem]', "新增节点");
+  await text("新建节点");
+  await fill("名称", name);
+  await fill("服务器", "127.0.0.1");
+  await fill("端口", port);
+  await click("[role=dialog] button", "保存");
+  await wait(`${name} node editor closed`, () => evaluate('!document.querySelector("[role=dialog]")'));
+  await text(name);
+}
+
+async function addProcessRule({ executable, node, unavailable, screenshot }) {
+  await click("button", "新增规则");
+  await text("新增共享规则");
+  await chooseDialogOption("匹配类型", "进程名");
+  await fill("匹配内容", executable);
+  await chooseDialogOption("处理方式", "指定节点或组");
+  await fill("所选出口", node);
+  await click('[role=option]', node, { partial: true });
+  await wait(`selected outlet ${node}`, () => evaluate(expression((name) => (
+    [...document.querySelectorAll('[role=dialog] input[role=combobox]')]
+      .some((el) => el.value === name && el.getAttribute("aria-expanded") === "false")
+  ), node)));
+  if (unavailable !== "阻断") {
+    await chooseDialogOption("所选出口不可用时", unavailable);
+  } else {
+    const select = '[role=dialog] [role=combobox]';
+    await wait("default outlet failure behavior is block", async () => (await evaluate(
+      expression(locate, select, "所选出口不可用时", false, false),
+    ))?.text === "阻断");
+  }
+  if (screenshot) await capture(screenshot);
+  await click("[role=dialog] button", "保存");
+  await wait(`${executable} rule editor closed`, () => evaluate('!document.querySelector("[role=dialog]")'));
+  await text(executable);
+}
+
+async function applySharedRules() {
+  await click("button", "保存并应用");
+  await wait("shared rules apply finished", () => evaluate(`Array.from(document.querySelectorAll("button")).some(
+    (el) => el.innerText.trim() === "保存并应用" && el.disabled && el.querySelector("[role=progressbar]") === null
+  )`));
 }
 
 async function text(value) {
@@ -226,10 +286,7 @@ try {
   await fill("匹配内容", "windows-smoke.example");
   await click("[role=dialog] button", "保存");
   await click("button", "中国大陆直连");
-  await click("button", "保存并应用");
-  await wait("shared rules apply finished", () => evaluate(`Array.from(document.querySelectorAll("button")).some(
-    (el) => el.innerText.trim() === "保存并应用" && el.disabled && el.querySelector("[role=progressbar]") === null
-  )`));
+  await applySharedRules();
   await text("windows-smoke.example");
   await text("GEOSITE");
   await text("GEOIP");
@@ -266,6 +323,37 @@ try {
   await wait("single-line rule order header", () => evaluate(`Array.from(document.querySelectorAll("th"))
     .some(el => el.textContent.trim() === "顺序" && getComputedStyle(el).whiteSpace === "nowrap")`));
   await capture("04-shared-rules-narrow");
+
+  report.stage = "seed local preview outlets";
+  await resize(1120);
+  await wait("restored wide native window", async () => await evaluate("innerWidth") >= 1050);
+  await navigate("nodes");
+  // UI-only fixtures. We never measure these nodes or send them traffic.
+  await addLoopbackNode("测试出口 A", "31081");
+  await addLoopbackNode("测试出口 B", "31082");
+
+  report.stage = "configure process-specific shared outlets";
+  await navigate("shared-routing");
+  await addProcessRule({ executable: "routa-fixture-a.exe", node: "测试出口 A",
+    unavailable: "阻断", screenshot: "05-process-rule-editor" });
+  await addProcessRule({ executable: "routa-fixture-b.exe", node: "测试出口 B",
+    unavailable: "直连" });
+  await applySharedRules();
+  // A second page mount reads persisted data rather than the discarded draft.
+  await navigate("listeners");
+  await navigate("shared-routing");
+  for (const [executable, node, unavailable] of [
+    ["routa-fixture-a.exe", "测试出口 A", "阻断"],
+    ["routa-fixture-b.exe", "测试出口 B", "直连"],
+  ]) {
+    await wait(`persisted rule ${executable} → ${node} (${unavailable})`, () => evaluate(expression((process, outlet, fallback) => (
+      [...document.querySelectorAll('[aria-label="共享规则列表"] tr')]
+        .some((row) => row.innerText.includes(process) && row.innerText.includes(outlet) &&
+          row.innerText.includes("不可用时" + fallback))
+    ), executable, node, unavailable)));
+  }
+  await find('[aria-label="共享规则列表"] tr', "routa-fixture-b.exe", { partial: true });
+  await capture("06-process-shared-rules");
   report.stage = "complete";
   report.status = "passed";
 } catch (error) {

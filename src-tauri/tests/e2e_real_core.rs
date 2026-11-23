@@ -2,9 +2,9 @@
 //!
 //! Run: MIHOMO_BIN=<path to mihomo exe> cargo test --test e2e_real_core -- --ignored --nocapture
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,8 +13,9 @@ use routa_lib::core::api::{HttpMihomoApi, MihomoApi};
 use routa_lib::core::ports::WindowsPortOwners;
 use routa_lib::core::process::{CoreLauncher, CoreState, ProcessLauncher};
 use routa_lib::model::{
-    Exit, ExitId, ExitKind, Listener, ListenerRouting, Model, PortRule, RuleAction, RuleMatch,
-    RuleProviderBehavior, RuleProviderFormat, Settings, SharedRule, SharedRuleProvider,
+    Exit, ExitId, ExitKind, ExitMember, Listener, ListenerRouting, ManualNode, ManualNodeId,
+    ManualNodeKind, Model, NodeRef, PortRule, RuleAction, RuleMatch, RuleProviderBehavior,
+    RuleProviderFormat, RuleUnavailable, Settings, SharedRule, SharedRuleProvider,
 };
 use routa_lib::netif::WindowsInterfaces;
 use routa_lib::runtime::{ApiFor, LauncherFor, Runtime};
@@ -41,6 +42,44 @@ fn spawn_target(delay: Duration) -> u16 {
                 let _ = s.read(&mut buf);
                 std::thread::sleep(delay);
                 let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+            });
+        }
+    });
+    port
+}
+
+/// A fake HTTP upstream proxy for routing assertions. It accepts CONNECT
+/// and responds to the tunneled GET with a distinct code, never sends it out.
+fn spawn_tagged_http_proxy(status: &'static str) -> u16 {
+    fn read_headers(stream: &mut BufReader<&mut TcpStream>, method: &str) -> bool {
+        let mut line = String::new();
+        if stream.read_line(&mut line).unwrap_or(0) == 0 || !line.starts_with(method) {
+            return false;
+        }
+        loop {
+            line.clear();
+            if stream.read_line(&mut line).unwrap_or(0) == 0 {
+                return false;
+            }
+            if line == "\r\n" {
+                return true;
+            }
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut socket in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut stream = BufReader::new(&mut socket);
+                if read_headers(&mut stream, "CONNECT ")
+                    && stream.get_mut().write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").is_ok()
+                    && read_headers(&mut stream, "GET ")
+                {
+                    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.get_mut().write_all(response.as_bytes());
+                }
             });
         }
     });
@@ -94,13 +133,34 @@ async fn wait_for_one_rule(ctrl: u16, secret: &str, name: &str) {
 }
 
 fn curl_status(proxy_port: u16, url: &str) -> String {
-    let out = Command::new("curl.exe")
-        .args(["-s", "-o", "NUL", "-w", "%{http_code}", "-m", "15", "-x"])
+    curl_status_from(Path::new("curl.exe"), proxy_port, url)
+}
+
+fn curl_status_from(program: &Path, proxy_port: u16, url: &str) -> String {
+    let out = Command::new(program)
+        .args(["-s", "-o", "NUL", "-w", "%{http_code}", "-m", "15", "--noproxy", "", "-x"])
         .arg(format!("http://127.0.0.1:{proxy_port}"))
         .arg(url)
         .output()
         .expect("curl.exe");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn test_http_node(name: &str, port: u16) -> ManualNode {
+    ManualNode {
+        id: ManualNodeId::new(),
+        name: name.to_owned(),
+        groups: vec![],
+        kind: ManualNodeKind::Proxy { raw: serde_json::json!({
+            "name": name, "type": "http", "server": "127.0.0.1", "port": port,
+        }) },
+    }
+}
+fn use_node(node: &ManualNode) -> RuleAction {
+    RuleAction::Target {
+        target: ExitMember::Node(NodeRef::Manual { manual_id: node.id.clone() }),
+        unavailable: RuleUnavailable::Reject,
+    }
 }
 
 fn ps_count(marker: &str) -> usize {
@@ -318,6 +378,57 @@ async fn real_core_two_listeners_direct_exit() {
     .unwrap();
     assert_ne!(first, "204", "the real provider must block through listener 1");
     assert_eq!(second, "204", "the rule provider must not affect listener 2");
+
+    // Local process discovery + explicit destination, on the same inbound.
+    // Two copies of Windows curl allow us to prove name and exact path matches
+    // rather than accidentally accepting the listener's default destination.
+    let curl = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"))
+        .join("System32").join("curl.exe");
+    assert!(curl.is_file(), "Windows curl.exe missing: {curl:?}");
+    let named = tmp.path().join("routa-name-probe.exe");
+    let by_path = tmp.path().join("routa-path-probe.exe");
+    std::fs::copy(&curl, &named).expect("copy name fixture");
+    std::fs::copy(&curl, &by_path).expect("copy path fixture");
+    let path_value = by_path.to_string_lossy().into_owned();
+    let one = test_http_node("process name tagged node", spawn_tagged_http_proxy("201 Created"));
+    let two = test_http_node("process path tagged node", spawn_tagged_http_proxy("202 Accepted"));
+    let named_action = use_node(&one);
+    let path_action = use_node(&two);
+    rt.mutate(move |m| {
+        m.manual_nodes.extend([one, two]);
+        m.shared_rules = vec![
+            SharedRule {
+                enabled: true, matcher: RuleMatch::ProcessName, value: "routa-name-probe.exe".into(),
+                action: named_action.clone(),
+            },
+            SharedRule {
+                enabled: true, matcher: RuleMatch::DomainKeyword, value: "routa-keyword".into(),
+                action: named_action,
+            },
+            SharedRule {
+                enabled: true, matcher: RuleMatch::Ipv6Cidr, value: "2001:db8::/32".into(),
+                action: path_action.clone(),
+            },
+        ];
+        m.listeners.iter_mut().find(|l| l.id == l1_id).unwrap().routing = Some(ListenerRouting {
+            rules: vec![PortRule {
+                matcher: RuleMatch::ProcessPath, value: path_value, action: path_action,
+            }],
+            unmatched: RuleAction::Proxy,
+        });
+    }).await.expect("apply extended matchers and explicit rule destinations");
+    assert!(rt.status().failed_listeners.is_empty(), "{:?}", rt.status().failed_listeners);
+    let test_url = format!("http://127.0.0.1:{t}/");
+    let codes = tokio::task::spawn_blocking(move || [
+        curl_status_from(&named, p1, &test_url),
+        curl_status_from(&by_path, p1, &test_url),
+        curl_status_from(&named, p2, &test_url),
+        curl_status(p1, &test_url),
+        curl_status(p1, "http://api-routa-keyword.example.invalid/"),
+        curl_status(p1, "http://[2001:db8::1]/"),
+    ]).await.unwrap();
+    assert_eq!(codes, ["201", "202", "204", "204", "201", "202"],
+        "name, path, isolated port, default, keyword, and IPv6 must take the expected destinations");
 
     // 3. Disable listener 2 -> its port refuses connections; listener 1 still works.
     assert!(!refuses(p2));

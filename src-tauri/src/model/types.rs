@@ -207,9 +207,25 @@ pub struct ListenerRouting {
     pub unmatched: RuleAction,
 }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
-pub enum RuleAction { Proxy, Direct, Reject }
+pub enum RuleAction {
+    Proxy,
+    Direct,
+    Reject,
+    Target {
+        target: ExitMember,
+        #[serde(default)]
+        #[specta(optional)]
+        unavailable: RuleUnavailable,
+    },
+}
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, specta::Type)]
+pub enum RuleUnavailable {
+    #[default]
+    Reject,
+    Direct,
+}
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
-pub enum RuleMatch { Domain, DomainSuffix, Ipv4Cidr, Geosite, Geoip, RuleSet }
+pub enum RuleMatch { Domain, DomainSuffix, DomainKeyword, Ipv4Cidr, Ipv6Cidr, Geosite, Geoip, RuleSet, ProcessName, ProcessPath }
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 pub struct PortRule {
     pub matcher: RuleMatch,
@@ -577,6 +593,20 @@ mod tests {
         let routing = m.listeners[0].routing.as_ref().unwrap();
         assert_eq!(routing.rules[0].matcher, RuleMatch::DomainSuffix);
         assert_eq!(routing.unmatched, RuleAction::Reject);
+    }
+
+    #[test]
+    fn explicit_rule_destination_defaults_to_block_when_missing() {
+        let rule: RuleAction = serde_json::from_str(r#"{"Target":{"target":{"manual_id":"node"}}}"#).unwrap();
+        assert_eq!(rule, RuleAction::Target {
+            target: ExitMember::Node(NodeRef::Manual { manual_id: ManualNodeId("node".into()) }),
+            unavailable: RuleUnavailable::Reject,
+        });
+        let direct: RuleAction = serde_json::from_str(r#"{"Target":{"target":{"group":{"Custom":"group"}},"unavailable":"Direct"}}"#).unwrap();
+        assert_eq!(direct, RuleAction::Target {
+            target: ExitMember::Group { group: GroupRef::Custom(NodeGroupId("group".into())) },
+            unavailable: RuleUnavailable::Direct,
+        });
     }
 
     #[test]

@@ -12,7 +12,7 @@ A Windows desktop proxy manager built on [mihomo](https://github.com/MetaCubeX/m
 - **Three ways to connect**: Windows system proxy, selected applications through process routing, or TUN through a virtual adapter. TUN requires running Routa as administrator.
 - **Independent proxy ports**: create `mixed` (HTTP + SOCKS5), `http`, or `socks` listeners. Configure each port's node, proxy group or direct outbound, network interface, authentication, and LAN access together.
 - **Network interface isolation**: when a configured outbound becomes unavailable or its bound adapter disconnects, the affected listener is disabled rather than silently switching to direct or the default adapter. It resumes when the adapter is available again.
-- **Per-port routing rules**: match an exact domain, domain suffix, or IPv4 CIDR in order, then proxy, connect directly, or reject. Set the action for unmatched traffic and check sample destinations in the editor.
+- **Per-port routing rules**: match domains (including keywords), IPv4/IPv6 CIDR, local process name or executable path, GeoIP/GeoSite, or rule sets in order. Each rule can use the port default, a selected node/group, direct, or reject.
 - **Subscriptions and nodes**: import Clash/mihomo YAML or base64 share-link subscriptions, schedule updates, and select a fallback proxy for subscription downloads. Create HTTP/SOCKS5 nodes with a form or import other mihomo node types from YAML, including batch imports. Search nodes, sort by latency, and organize custom groups.
 - **Proxy groups and Tailscale**: use `url-test`, `fallback`, `load-balance`, or `select` groups; manage Tailscale nodes, login state, and exit settings.
 - **Process routing**: rules send a group of programs to a Mixed/Socks listener; inspect each rule's connections and traffic. Programs match by process name (such as `ChatGPT.exe`) by default, or by full path from the advanced options; only full-path rules can block on component failure. A separate policy in Settings → 进程分流 controls behavior when Routa exits normally.
@@ -51,6 +51,10 @@ Stopping system proxy or TUN leaves the core and proxy ports available; manually
 In Full mode, open **共享规则** (Shared rules) to edit, reorder, and toggle common rules or add the mainland-China direct preset. To use a remote mihomo rule set, register it first and then reference it from a `RULE-SET` rule. Routa fetches these sources directly, independently of proxy ports; prefer trusted HTTPS sources.
 
 Opt in separately for each listener in **代理** (Proxies). Routa checks **per-port rules → enabled shared rules → the port's existing fallback**, in that order. A Proxy action still uses the listener's own outbound. Existing listeners do not opt in automatically. Process-routing settings do not need to change.
+
+Explicit node or group targets remain bound to the port's chosen network interface. Groups try their members in order using mihomo fallback. If a target is missing or unusable in the current configuration, its rule rejects traffic by default, or goes directly through the same interface if you select that explicitly. This does not retry failed live connections on a direct route. If the selected node cannot carry UDP, that traffic is blocked rather than falling through to the port default. These new rule types and explicit targets apply to the proxy port, not to its ancillary TUN or subscription-refresh paths.
+
+Process matchers use Windows information for connections made by local applications to the port. They cannot identify the executable on another device or behind another proxy; keep using **进程分流** (Process routing) for apps that need to be captured automatically. Process and live data matches require actual traffic; the offline rule preview cannot verify them.
 
 ## Process-routing component
 

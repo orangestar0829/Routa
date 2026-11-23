@@ -4,11 +4,12 @@ import { commands, type Model, type SharedRule } from "../bindings";
 import { SharedRoutingPage } from "./SharedRouting";
 
 vi.mock("../bindings", () => ({
-  commands: { getModel: vi.fn(), saveSharedRouting: vi.fn() },
+  commands: { getModel: vi.fn(), getStatus: vi.fn(), saveSharedRouting: vi.fn() },
 }));
 
 function setup(initial: Partial<Model> = {}) {
-  let current = { listeners: [], ...initial } as Model;
+  let current = { listeners: [], subscriptions: [], manual_nodes: [], node_groups: [], ...initial } as Model;
+  vi.mocked(commands.getStatus).mockResolvedValue({ delays: {} } as never);
   vi.mocked(commands.getModel).mockImplementation(async () => current);
   vi.mocked(commands.saveSharedRouting).mockImplementation(async (rules, providers) => {
     current = { ...current, shared_rules: rules, shared_rule_providers: providers };
@@ -128,4 +129,53 @@ it("keeps the draft on backend validation failure", async () => {
   expect(screen.getByText("尚未保存")).toBeInTheDocument();
   click("还原更改");
   expect(await screen.findByText("还没有共享规则")).toBeInTheDocument();
+});
+
+
+it("matches a local process path and routes to a saved group with explicit Direct fallback", async () => {
+  setup({
+    node_groups: [{ id: "work", name: "工作出口" }],
+    manual_nodes: [{ id: "n1", name: "本地节点", groups: ["work"], kind: { Proxy: { raw: {} } } }],
+  });
+  await screen.findByText("还没有共享规则");
+  click("新增规则");
+  choose("匹配类型", "进程路径");
+  input("匹配内容", "C:\\Program Files\\App\\App.exe");
+  expect(screen.getByText(/仅匹配内核能识别本机进程的连接/)).toBeInTheDocument();
+  choose("处理方式", "指定节点或组");
+  expect(screen.getByRole("combobox", { name: "所选出口不可用时" })).toHaveTextContent("阻断");
+  click("保存");
+  expect(screen.getByText("请选择节点或组")).toBeInTheDocument();
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "所选出口" }));
+  fireEvent.click(await screen.findByRole("option", { name: /工作出口（整组/ }));
+  choose("所选出口不可用时", "直连");
+  expect(screen.getByText("选定出口不可用时，流量会绕过代理。")).toBeInTheDocument();
+  click("保存");
+  expect(screen.getByText("工作出口（自建组）")).toBeInTheDocument();
+  expect(screen.getByText("不可用时直连")).toBeInTheDocument();
+  click("保存并应用");
+  await waitFor(() => expect(commands.saveSharedRouting).toHaveBeenCalledWith([{
+    matcher: "ProcessPath", value: "C:\\Program Files\\App\\App.exe", enabled: true,
+    action: { Target: { target: { group: { Custom: "work" } }, unavailable: "Direct" } },
+  }], []));
+});
+
+it("allows an imported RULE-SET to target a node, defaulting to Reject if unavailable", async () => {
+  setup({ manual_nodes: [{ id: "n1", name: "本地节点", groups: [], kind: { Proxy: { raw: {} } } }] });
+  await screen.findByText("还没有共享规则");
+  fireEvent.click(screen.getByRole("tab", { name: "规则集" }));
+  click("导入规则集");
+  input("规则集名称", "sites");
+  input("远程地址", "https://rules.example/sites.yaml");
+  choose("处理方式", "指定节点或组");
+  fireEvent.mouseDown(screen.getByRole("combobox", { name: "所选出口" }));
+  fireEvent.click(await screen.findByRole("option", { name: "本地节点" }));
+  click("导入");
+  click("保存并应用");
+  await waitFor(() => expect(commands.saveSharedRouting).toHaveBeenCalledWith(
+    [{ matcher: "RuleSet", value: "sites", enabled: true, action: {
+      Target: { target: { manual_id: "n1" }, unavailable: "Reject" },
+    } }],
+    [expect.objectContaining({ name: "sites" })],
+  ));
 });
