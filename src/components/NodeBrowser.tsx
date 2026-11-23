@@ -44,7 +44,7 @@ export function useNodeBrowser(members: NodeRef[]) {
               (manual.kind.Proxy.raw as Record<string, unknown>)?.type ??
                 "代理",
             )
-          : manual && "Chain" in manual.kind ? "TCP · 2 跳" : "代理");
+          : manual && "Chain" in manual.kind ? `TCP · ${manual.kind.Chain.hops.length} 跳` : "代理");
     const unavailable = m && manual && "Chain" in manual.kind ? chainProblem(m, manual.kind.Chain) : undefined;
     const proxy = m && !unavailable ? proxyNameOf(m, ref) : null;
     return { ref, name: m ? nodeLabel(m, ref) : "", source, type, proxy, unavailable };

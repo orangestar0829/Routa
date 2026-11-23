@@ -46,9 +46,11 @@ System proxy affects applications that honor Windows proxy settings. For applica
 
 Stopping system proxy or TUN leaves the core and proxy ports available; manually configured clients and independently enabled process-routing rules may still use them.
 
-### Two-hop proxy chains
+### Ordered proxy chains
 
-Under **节点 → 新增 → 新增代理链** (Nodes → Add → Add Proxy Chain), choose an entry hop and an exit hop. Select the saved chain as a single fixed port outbound or a specific rule target. Measure its end-to-end delay in Nodes. If the original subscription node can no longer be resolved, repair the hop manually; Routa does not choose another node.
+Under **节点 → 新增 → 新增代理链** (Nodes → Add → Add Proxy Chain), choose 2–8 ordinary nodes in dialing order. Add, remove or move hops and check the route preview: the first node is the entry and the last is the exit. Existing two-hop chains keep their order and ID. Select the saved chain as a single fixed port outbound or a specific rule target. Measure its end-to-end delay in Nodes. If the original subscription node can no longer be resolved, repair the hop manually; Routa does not choose another node.
+
+Two-hop-only profiles remain readable in the prior two-hop preview. Do not open a profile containing a longer chain with that preview. Before first saving a longer chain over an existing compatible profile, Routa keeps its exact previous `state.json` as `state.before-multihop.json`. To roll back, close Routa, keep a copy of your current state file, then copy the backup over `state.json`; later changes are not part of that snapshot.
 
 The first version supports TCP with eligible HTTP, SOCKS5, Shadowsocks without plugins, VMess, VLESS, and Trojan nodes. UDP, nested chains, Tailscale, and using chains as strategy-group members are not supported. A connection timeout never falls back to Direct. Only an explicit Direct rule, or an explicitly configured Direct policy for a rule whose target can no longer be resolved, uses that route.
 

@@ -791,10 +791,9 @@ export type ManualNodeKind =
  */
 { Proxy: { raw: JsonValue } } | { Tailscale: TailscaleOpts } |
 /**
- * Fixed TCP route: the local core dials `entry`, which reaches `exit`.
- * The chain is itself a manual node with an independent stable UUID.
+ * Ordered TCP route with an independent stable node ID.
  */
-{ Chain: { entry: NodeRef; exit: NodeRef } }
+{ Chain: ProxyChain }
 export type Model = { subscriptions: Subscription[]; exits: Exit[]; listeners: Listener[]; settings: Settings; manual_nodes: ManualNode[]; node_groups: NodeGroup[]; process_routing: ProcessRouting; shared_rules?: SharedRule[]; shared_rule_providers?: SharedRuleProvider[] }
 /**
  * Why a target failed a round.
@@ -933,6 +932,10 @@ export type ProcessRuleId = string
  * frontend can only open these two.
  */
 export type ProjectLink = "Website" | "GitHub"
+/**
+ * Physical nodes in TCP dialing order. Only the final hop is the exit.
+ */
+export type ProxyChain = { hops: NodeRef[] }
 /**
  * Bytes per second.
  */

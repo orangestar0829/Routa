@@ -160,13 +160,11 @@ pub mod ops {
 
     pub async fn save_manual_node(rt: &Runtime, n: ManualNode) -> CmdResult {
         rt.mutate_with(|m| {
-            if let ManualNodeKind::Chain { entry, exit } = &n.kind {
-                if entry == exit || [entry, exit].into_iter()
-                    .any(|r| crate::model::resolve::resolve_chain_hop(m, r).is_none())
-                {
+            if let ManualNodeKind::Chain(chain) = &n.kind {
+                if crate::model::resolve_chain_hops(m, chain).is_none() {
                     return Err(vec![ValidationError::InvalidProxy {
                         name: n.name.clone(),
-                        reason: "请选择两个不同、可用的普通 TCP 代理节点，不支持嵌套".into(),
+                        reason: chain.shape_problem().unwrap_or("请为每一跳选择可用的普通 TCP 代理节点，不支持嵌套").into(),
                     }]);
                 }
             }
@@ -332,7 +330,7 @@ pub mod ops {
     pub async fn save_manual_nodes(rt: &Runtime, nodes: Vec<ManualNode>) -> CmdResult {
         rt.mutate_with(|m| {
             if let Some(node) = nodes.iter().find(|n| {
-                matches!(n.kind, ManualNodeKind::Chain { .. })
+                matches!(n.kind, ManualNodeKind::Chain(_))
                     || crate::model::resolve::is_chain_ref(m, &NodeRef::Manual { manual_id: n.id.clone() })
             }) {
                 return Err(vec![ValidationError::InvalidProxy {
@@ -1245,7 +1243,7 @@ pub(crate) mod tests {
         let hop3 = proxy_node("alternate last", vec![]);
         let mut chain = ManualNode {
             id: ManualNodeId::new(), name: "chain".into(), groups: vec![],
-            kind: ManualNodeKind::Chain { entry: mref(&hop1), exit: mref(&hop2) },
+            kind: ManualNodeKind::Chain(ProxyChain { hops: vec![mref(&hop1), mref(&hop2)] }),
         };
         assert!(ops::save_manual_node(&rt, chain.clone()).await.is_err(), "missing hops");
         for hop in [&hop1, &hop2, &hop3] {
@@ -1257,7 +1255,7 @@ pub(crate) mod tests {
         assert!(ops::delete_manual_node(&rt, hop2.id.clone()).await.is_err(), "still in use");
 
         chain.name = "renamed chain".into();
-        chain.kind = ManualNodeKind::Chain { entry: mref(&hop1), exit: mref(&hop3) };
+        chain.kind = ManualNodeKind::Chain(ProxyChain { hops: vec![mref(&hop1), mref(&hop3)] });
         assert!(ops::save_manual_nodes(&rt, vec![chain.clone()]).await.is_err(), "not a pasted node");
         ops::save_manual_node(&rt, chain.clone()).await.unwrap();
         assert_eq!(rt.model().exits, vec![exit]);

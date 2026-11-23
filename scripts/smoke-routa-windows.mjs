@@ -215,22 +215,30 @@ async function addProcessRule({ executable, node, unavailable, screenshot, expec
   await text(executable);
 }
 
-async function addProxyChain(name, entry, exit) {
+async function addProxyChain(name, entry, middle, exit) {
   await click('button[aria-haspopup="menu"]', "新增");
   await click('[role=menuitem]', "新增代理链");
   await text("新增代理链");
   await fill("名称", name, { partial: true }); // Required label includes an asterisk.
   await chooseNamedNode("前置节点（第 1 跳）", entry);
   await chooseNamedNode("落地节点（第 2 跳）", exit);
+  await click('[role=dialog] button', "添加一跳");
+  await chooseNamedNode("落地节点（第 3 跳）", middle);
+  await click('[role=dialog] button', "上移第 3 跳");
+  await wait("ordered entry → middle → exit preview", () => evaluate(expression((hops) => {
+    const dialog = document.querySelector("[role=dialog]");
+    return dialog?.querySelector('[aria-label="链路预览"]')?.textContent.trim() === hops.join(" → ")
+      && [...dialog.querySelectorAll('input[role=combobox]')].map(el => el.value).join("|") === hops.join("|");
+  }, [entry, middle, exit])));
   await find('[role=dialog] button', "保存");
   await capture("07-proxy-chain-editor");
   await click('[role=dialog] button', "保存");
   await wait("proxy chain editor closed", () => evaluate('!document.querySelector("[role=dialog]")'));
   const card = `article[aria-label="${name}"]`;
   await find(card);
-  await wait("one saved two-hop proxy chain node", () => evaluate(expression((selector) => {
+  await wait("one saved three-hop proxy chain node", () => evaluate(expression((selector) => {
     const rows = [...document.querySelectorAll(selector)];
-    return rows.length === 1 && rows[0].innerText.includes("代理链") && rows[0].innerText.includes("TCP · 2 跳");
+    return rows.length === 1 && rows[0].innerText.includes("代理链") && rows[0].innerText.includes("TCP · 3 跳");
   }, card)));
   await capture("08-proxy-chain-node");
 }
@@ -420,10 +428,11 @@ try {
   await find('[aria-label="共享规则列表"] tr', "routa-fixture-b.exe", { partial: true });
   await capture("06-process-shared-rules");
 
-  report.stage = "create a two-hop chain from loopback fixture nodes";
+  report.stage = "create and reorder a three-hop chain from loopback fixture nodes";
   await navigate("nodes");
-  const chain = "双跳测试出口";
-  await addProxyChain(chain, "测试出口 A", "测试出口 B");
+  await addLoopbackNode("测试中转 C", "31083");
+  const chain = "三跳测试出口";
+  await addProxyChain(chain, "测试出口 A", "测试中转 C", "测试出口 B");
 
   report.stage = "select the saved chain as one shared rule outlet";
   await navigate("shared-routing");

@@ -32,10 +32,17 @@ fn refuses(port: u16) -> bool {
 
 /// Tiny HTTP server: answers every request with 204 after `delay`.
 fn spawn_target(delay: Duration) -> u16 {
+    spawn_counted_target(delay).0
+}
+
+fn spawn_counted_target(delay: Duration) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = count.clone();
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for s in l.incoming().flatten() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::spawn(move || {
                 let mut s = s;
                 let mut buf = [0u8; 2048];
@@ -45,7 +52,7 @@ fn spawn_target(delay: Duration) -> u16 {
             });
         }
     });
-    port
+    (port, count)
 }
 
 /// A fake HTTP upstream proxy for routing assertions. It accepts CONNECT
@@ -513,7 +520,7 @@ async fn real_core_two_listeners_direct_exit() {
 }
 
 /// A loopback-only CONNECT hop: log the requested authority, forward only to
-/// the expected next socket, and allow tests to make the entry unavailable.
+/// the expected next socket, and allow tests to refuse a selected hop.
 fn spawn_chain_hop(
     hop: &'static str,
     connector: TcpListener,
@@ -640,7 +647,17 @@ fn local_socks_udp_echo(proxy_port: u16, echo_port: u16, payload: &[u8]) -> bool
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
-    use routa_lib::model::{ExitMember, ManualNode, ManualNodeId, ManualNodeKind, NodeRef, RuleUnavailable};
+    exercise_chain(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn real_core_three_hops_in_order_and_broken_middle_never_bypasses() {
+    exercise_chain(true).await;
+}
+
+async fn exercise_chain(with_middle: bool) {
+    use routa_lib::model::ProxyChain;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let bin = PathBuf::from(std::env::var("MIHOMO_BIN").expect("set MIHOMO_BIN"));
@@ -650,7 +667,7 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
     let workdir = store.core_workdir();
     let _guard = KillOnDrop(tmp.path().file_name().unwrap().to_string_lossy().into_owned());
 
-    let target = spawn_target(Duration::ZERO);
+    let (target, arrivals) = spawn_counted_target(Duration::ZERO);
     // Reserve the sockets together so parallel real-core tests can't pick the
     // same port twice during setup. Release the core's sockets right at start.
     let reserve = || TcpListener::bind("127.0.0.1:0").unwrap();
@@ -661,14 +678,19 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
         control_socket.local_addr().unwrap().port(),
         ctrl_socket.local_addr().unwrap().port(),
     );
+    let fixed_socket = reserve();
+    let fixed_port = fixed_socket.local_addr().unwrap().port();
     let trace = Arc::new(Mutex::new(Vec::new()));
-    let entry_available = Arc::new(AtomicBool::new(true));
+    let toggle = Arc::new(AtomicBool::new(true));
     let exit_port = spawn_chain_hop(
         "exit", exit_socket, target, trace.clone(), Arc::new(AtomicBool::new(true)),
     );
-    let entry_port = spawn_chain_hop(
-        "entry", entry_socket, exit_port, trace.clone(), entry_available.clone(),
-    );
+    let middle_port = with_middle.then(|| spawn_chain_hop(
+        "middle", reserve(), exit_port, trace.clone(), toggle.clone(),
+    ));
+    let entry_next = middle_port.unwrap_or(exit_port);
+    let entry_port = spawn_chain_hop("entry", entry_socket, entry_next, trace.clone(),
+        if with_middle { Arc::new(AtomicBool::new(true)) } else { toggle.clone() });
     let http_node = |name: &str, port| ManualNode {
         id: ManualNodeId::new(),
         name: name.into(),
@@ -679,16 +701,18 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
             }),
         },
     };
-    let entry = http_node("first hop", entry_port);
-    let exit = http_node("last hop", exit_port);
+    let mut nodes = vec![http_node("first hop", entry_port)];
+    if let Some(port) = middle_port { nodes.push(http_node("middle hop", port)); }
+    nodes.push(http_node("last hop", exit_port));
     let chain = ManualNode {
-        id: ManualNodeId::new(),
-        name: "two hop chain".into(),
-        groups: vec![],
-        kind: ManualNodeKind::Chain {
-            entry: NodeRef::Manual { manual_id: entry.id.clone() },
-            exit: NodeRef::Manual { manual_id: exit.id.clone() },
-        },
+        id: ManualNodeId::new(), name: "ordered chain".into(), groups: vec![],
+        kind: ManualNodeKind::Chain(ProxyChain { hops: nodes.iter()
+            .map(|n| NodeRef::Manual { manual_id: n.id.clone() }).collect() }),
+    };
+    let chain_ref = NodeRef::Manual { manual_id: chain.id.clone() };
+    nodes.push(chain);
+    let fixed = Exit {
+        name: "fixed chain".into(), kind: ExitKind::Node { node: chain_ref.clone() }, ..Exit::default()
     };
     let control = Exit {
         id: ExitId::new(),
@@ -711,7 +735,7 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
             matcher: RuleMatch::Ipv4Cidr,
             value: "127.0.0.1/32".into(),
             action: RuleAction::Target {
-                target: ExitMember::Node(NodeRef::Manual { manual_id: chain.id.clone() }),
+                target: ExitMember::Node(chain_ref),
                 // Even an explicitly selected, configuration-only fallback
                 // must not reroute live UDP or a failed TCP connection.
                 unavailable: RuleUnavailable::Direct,
@@ -720,10 +744,12 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
         unmatched: RuleAction::Direct,
     });
     let model = Model {
-        exits: vec![control.clone()],
-        listeners: vec![routed_listener, listener("control port", control_port, control.id)],
-        manual_nodes: vec![entry, exit, chain],
-        settings: Settings { controller_port: ctrl, ..Settings::default() },
+        exits: vec![control.clone(), fixed.clone()],
+        listeners: vec![routed_listener, listener("control port", control_port, control.id),
+            listener("fixed chain port", fixed_port, fixed.id)],
+        manual_nodes: nodes,
+        settings: Settings { controller_port: ctrl, delay_test_interval_mins: None,
+            delay_test_url: format!("http://127.0.0.1:{target}/"), ..Settings::default() },
         ..Model::default()
     };
     store.save_model(&model).unwrap();
@@ -737,7 +763,7 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
     let rt = Runtime::new(
         store, Arc::new(WindowsInterfaces), launcher_for, api_for, Arc::new(WindowsPortOwners), tx,
     );
-    drop((routed_socket, control_socket, ctrl_socket));
+    drop((routed_socket, control_socket, ctrl_socket, fixed_socket));
     rt.start().await.expect("start real core with chain");
     assert_eq!(rt.status().core, CoreState::Running);
     assert!(rt.status().failed_listeners.is_empty(), "{:?}", rt.status().failed_listeners);
@@ -745,11 +771,21 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
 
     assert_eq!(probe(control_port).await.unwrap(), Some(204), "target must really be reachable");
     assert!(trace.lock().unwrap().is_empty(), "control must not hit either chain hop");
-    assert_eq!(probe(routed_port).await.unwrap(), Some(204));
-    assert_eq!(trace.lock().unwrap().as_slice(), &[
-        ("entry", format!("127.0.0.1:{exit_port}")),
-        ("exit", format!("127.0.0.1:{target}")),
-    ]);
+    let mut expected = vec![("entry", format!("127.0.0.1:{entry_next}"))];
+    if with_middle { expected.push(("middle", format!("127.0.0.1:{exit_port}"))); }
+    expected.push(("exit", format!("127.0.0.1:{target}")));
+    for port in [routed_port, fixed_port] {
+        assert_eq!(probe(port).await.unwrap(), Some(204));
+        assert_eq!(std::mem::take(&mut *trace.lock().unwrap()), expected, "TCP port {port}");
+    }
+    // The Nodes page probes the public chain name, not a private hop or
+    // the plain exit. Some core versions make two URL tests for unified delay.
+    let measured = rt.test_delays(vec!["手动/ordered chain".into()]).await;
+    assert!(measured[0].1.ms.is_some(), "whole-chain delay failed: {measured:?}");
+    let observed = std::mem::take(&mut *trace.lock().unwrap());
+    assert!(!observed.is_empty());
+    assert!(observed.chunks(expected.len()).all(|part| part == expected.as_slice()),
+        "delay probe bypassed a hop: {observed:?}");
 
     let (echo_port, udp_packets) = spawn_udp_echo();
     let udp_probe = |port, payload: &'static [u8]| {
@@ -761,13 +797,17 @@ async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
     assert_eq!(udp_packets.lock().unwrap().as_slice(), &[b"direct-control".to_vec()]);
 
     trace.lock().unwrap().clear();
-    entry_available.store(false, Ordering::SeqCst);
-    assert_ne!(probe(routed_port).await.unwrap(), Some(204), "broken entry must not fall back");
+    let before_failure = arrivals.load(Ordering::SeqCst);
+    toggle.store(false, Ordering::SeqCst);
+    assert_ne!(probe(routed_port).await.unwrap(), Some(204), "failed hop must not fall back");
     {
         let trace = trace.lock().unwrap();
         assert!(!trace.is_empty(), "the chain was not attempted");
-        assert!(trace.iter().all(|(hop, _)| *hop == "entry"), "bypassed first hop: {trace:?}");
+        let allowed = &expected[..expected.len() - 1];
+        assert!(trace.iter().any(|hit| hit == allowed.last().unwrap()), "failed hop was not attempted: {trace:?}");
+        assert!(trace.iter().all(|hit| allowed.contains(hit)), "bypassed failed hop: {trace:?}");
     }
+    assert_eq!(arrivals.load(Ordering::SeqCst), before_failure, "destination received a bypass connection");
     assert_eq!(probe(control_port).await.unwrap(), Some(204), "destination remains reachable directly");
     rt.shutdown().await;
 }

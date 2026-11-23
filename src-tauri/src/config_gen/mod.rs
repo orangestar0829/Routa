@@ -214,33 +214,53 @@ fn resolved_copy(raw: &serde_json::Value, manual: bool, name: &str, interface: O
     if manual { manual_defaults(p) } else { p }
 }
 
-fn chain_proxy_pair(
+#[derive(Clone, Copy)]
+enum ChainScope<'a> {
+    Base,
+    Exit(&'a str),
+    Rule(&'a str),
+}
+
+impl ChainScope<'_> {
+    fn suffix(self) -> String {
+        let (kind, id) = match self {
+            Self::Base => return "base".into(),
+            Self::Exit(id) => ("exit", id),
+            Self::Rule(id) => ("rule", id),
+        };
+        let encoded: String = id.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("{kind}_{encoded}")
+    }
+}
+
+fn chain_proxies(
     node: &ManualNode,
-    entry: ChainHop<'_>,
-    exit: ChainHop<'_>,
+    hops: &[ChainHop<'_>],
     target_name: &str,
-    scope: Option<&ExitId>,
+    scope: ChainScope<'_>,
     interface: Option<&str>,
 ) -> Option<Vec<Value>> {
-    let entry_name = match scope {
-        None => format!("__chain_hop1_{}_base", node.id.0),
-        Some(scope) => {
-            // Collision-free scope encoding: user-facing names never appear
-            // in rule grammar or in raw dialer-proxy values.
-            let encoded: String = scope.0.bytes().map(|b| format!("{b:02x}")).collect();
-            format!("__chain_hop1_{}_exit_{encoded}", node.id.0)
+    let scope = scope.suffix();
+    let mut previous = None;
+    let mut proxies = Vec::with_capacity(hops.len());
+    for (i, hop) in hops.iter().enumerate() {
+        // Only the terminal copy is addressable as the user's chosen outlet.
+        // Earlier copies use reserved, scope- and position-specific names.
+        let name = if i + 1 == hops.len() { target_name.to_owned() }
+            else { format!("__chain_hop{}_{}_{scope}", i + 1, node.id.0) };
+        let nic = if i == 0 { interface } else { None };
+        let Value::Mapping(mut proxy) = resolved_copy(hop.raw, hop.manual, &name, nic)? else {
+            return None;
+        };
+        remove_proxy_keys(&mut proxy, &["udp", "udp-over-tcp"]);
+        proxy.insert(s("udp"), Value::Bool(false));
+        if let Some(parent) = previous {
+            proxy.insert(s("dialer-proxy"), Value::String(parent));
         }
-    };
-    // The physical socket is opened by the first hop, not by the exit's
-    // proxydialer. Binding only the exit would silently lose NIC pinning.
-    let first = resolved_copy(entry.raw, entry.manual, &entry_name, interface)?;
-    let Value::Mapping(mut last) = resolved_copy(exit.raw, exit.manual, target_name, None)? else {
-        return None;
-    };
-    remove_proxy_keys(&mut last, &["udp", "udp-over-tcp"]);
-    last.insert(s("dialer-proxy"), s(&entry_name));
-    last.insert(s("udp"), Value::Bool(false));
-    Some(vec![first, Value::Mapping(last)])
+        proxies.push(Value::Mapping(proxy));
+        previous = Some(name);
+    }
+    Some(proxies)
 }
 
 fn chain_exit(model: &Model, exit: &Exit) -> bool {
@@ -305,11 +325,11 @@ fn manual_node_parts(model: &Model, node: &ManualNode, nics: &[NetInterface]) ->
         ManualNodeKind::Proxy { raw } => manual_defaults(proxy_copy(raw, &name, None))
             .into_iter().collect(),
         ManualNodeKind::Tailscale(opts) => tailscale_def(node, opts, nics).into_iter().collect(),
-        ManualNodeKind::Chain { .. } => {
+        ManualNodeKind::Chain(_) => {
             let r = NodeRef::Manual { manual_id: node.id.clone() };
             match resolve(model, &r) {
-                Some(Resolved::Chain { node, entry, exit }) =>
-                    chain_proxy_pair(node, entry, exit, &name, None, None).unwrap_or_default(),
+                Some(Resolved::Chain { node, hops }) =>
+                    chain_proxies(node, &hops, &name, ChainScope::Base, None).unwrap_or_default(),
                 _ => vec![],
             }
         }
@@ -346,7 +366,7 @@ struct ExitParts {
 }
 
 /// `None` when nothing could be emitted for the exit (treated as not Ok).
-fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface]) -> Option<ExitParts> {
+fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface], scope: ChainScope<'_>) -> Option<ExitParts> {
     let iface = h.interface.as_ref().map(|n| n.mihomo_name.as_str());
     let parts = match &exit.kind {
         ExitKind::Node { .. } => match h.effective_members.first().and_then(|r| resolve(model, r)) {
@@ -355,8 +375,8 @@ fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface])
                 group: None,
                 shared: vec![],
             },
-            Some(Resolved::Chain { node, entry, exit: last }) => ExitParts {
-                proxies: chain_proxy_pair(node, entry, last, &exit.name, Some(&exit.id), iface)?,
+            Some(Resolved::Chain { node, hops }) => ExitParts {
+                proxies: chain_proxies(node, &hops, &exit.name, scope, iface)?,
                 group: None,
                 shared: vec![],
             },
@@ -453,7 +473,7 @@ fn rule_target_parts(input: &GenInput<'_>, port_exit: &Exit, alias: &str, target
         Some(Resolved::Tailscale { opts, .. }) => opts.interface == port_exit.interface,
         _ => true,
     });
-    exit_parts(input.model, &exit, &health, input.nics)
+    exit_parts(input.model, &exit, &health, input.nics, ChainScope::Rule(alias))
 }
 
 fn hash_yaml(v: &Value) -> u64 {
@@ -502,7 +522,7 @@ pub fn delay_fingerprints(model: &Model, health: &Health, nics: &[NetInterface])
     }
     for exit in &model.exits {
         let Some(h) = health.exits.get(&exit.id).filter(|h| h.status == ExitStatus::Ok) else { continue };
-        let Some(parts) = exit_parts(model, exit, h, nics) else { continue };
+        let Some(parts) = exit_parts(model, exit, h, nics, ChainScope::Exit(&exit.id.0)) else { continue };
         let selected = match &exit.kind { ExitKind::Group { selected, .. } => serde_yaml_ng::to_value(selected).expect("selection serialization"), _ => Value::Null };
         record(exit.name.clone(), map(vec![("config", Value::from(fingerprint(&parts))), ("selected", selected)]));
     }
@@ -562,7 +582,7 @@ pub fn generate(input: &GenInput) -> Generated {
         })
         .collect();
     // Base copies for measurement. Each Tailscale instance is emitted once;
-    // each fixed chain emits its own first-hop and final-hop definitions.
+    // each chain emits its entire ordered set of physical hops.
     proxies.extend(model.manual_nodes.iter().flat_map(|n| manual_node_parts(model, n, input.nics)));
 
     let mut groups = Vec::new();
@@ -576,7 +596,7 @@ pub fn generate(input: &GenInput) -> Generated {
         if h.status != ExitStatus::Ok {
             continue;
         }
-        let Some(parts) = exit_parts(model, exit, h, input.nics) else {
+        let Some(parts) = exit_parts(model, exit, h, input.nics, ChainScope::Exit(&exit.id.0)) else {
             continue;
         };
         fingerprints.insert(&exit.id, fingerprint(&parts));
@@ -1689,7 +1709,7 @@ mod tests {
             id: ManualNodeId("chain".into()),
             name: "两跳".into(),
             groups: vec![],
-            kind: ManualNodeKind::Chain { entry: nref("HK 01"), exit: mref("last") },
+            kind: ManualNodeKind::Chain(ProxyChain { hops: vec![nref("HK 01"), mref("last")] }),
         });
         m.exits[0].kind = ExitKind::Node { node: mref("chain") };
         m
@@ -1754,6 +1774,100 @@ mod tests {
     }
 
     #[test]
+    fn ordered_chain_copies_and_hashes_every_hop_in_each_scope() {
+        let mut m = chain_model();
+        // Exercise the upper bound, combining imported and manual nodes. IDs
+        // (not display names) scope private copies of the same physical hops.
+        let mut hops = vec![nref("HK 01")];
+        for i in 2..MAX_CHAIN_HOPS {
+            let id = format!("mid-{i}");
+            let mut node = proxy_manual(&id, &id, &[]);
+            let ManualNodeKind::Proxy { raw } = &mut node.kind else { unreachable!() };
+            raw["port"] = json!(8000 + i);
+            raw["dialer_proxy"] = json!("DIRECT");
+            raw["DIALER-PROXY"] = json!("DIRECT");
+            raw["interface_name"] = json!("not this NIC");
+            raw["UDP_OVER_TCP"] = json!(true);
+            m.manual_nodes.push(node);
+            hops.push(mref(&id));
+        }
+        hops.push(mref("last"));
+        m.manual_nodes[1].kind = ManualNodeKind::Chain(ProxyChain { hops: hops.clone() });
+        m.listeners[0].routing = Some(ListenerRouting {
+            unmatched: RuleAction::Direct,
+            rules: vec![PortRule { matcher: RuleMatch::Domain, value: "local.test".into(),
+                action: target_action(ExitMember::Node(mref("chain")), RuleUnavailable::Reject) }],
+        });
+        assert!(crate::model::validate(&m).is_ok());
+        let n = nics();
+        let before = m.clone();
+        let generated = gen(&m);
+        let y = parse(&generated.yaml);
+        assert_eq!(m, before);
+        let mut private_names = BTreeSet::new();
+        for (target, nic) in [("手动/两跳", None), ("出口A", Some("以太网")), ("__rule_target_la_0", Some("以太网"))] {
+            let mut p = find(&y, "proxies", target).unwrap();
+            for i in (0..MAX_CHAIN_HOPS).rev() {
+                if i < MAX_CHAIN_HOPS - 1 {
+                    let name = p["name"].as_str().unwrap();
+                    assert!(name.starts_with("__chain_hop"));
+                    assert!(private_names.insert(name.to_owned()), "scope collision: {name}");
+                }
+                let expected = resolve_chain_hop(&m, &hops[i]).unwrap().raw;
+                assert_eq!(p["server"].as_str(), expected["server"].as_str());
+                assert_eq!(p["port"].as_u64(), expected["port"].as_u64());
+                assert_eq!(p["interface-name"].as_str(), if i == 0 { nic } else { None });
+                assert_eq!(p["udp"].as_bool(), Some(false));
+                for key in ["dialer_proxy", "DIALER-PROXY", "interface_name", "UDP_OVER_TCP"] {
+                    assert!(p.get(key).is_none(), "unsanitized {key} at hop {i}");
+                }
+                if i > 0 {
+                    p = find(&y, "proxies", p["dialer-proxy"].as_str().unwrap()).unwrap();
+                } else {
+                    assert!(p.get("dialer-proxy").is_none());
+                }
+            }
+        }
+        let delay_hashes = |model: &Model| delay_fingerprints(model, &evaluate(model, &n), &n);
+        let hashes = delay_hashes(&m);
+        let plan = &generated.plan.listeners["入口A"];
+        for hop in &hops {
+            let mut changed = m.clone();
+            let raw = match hop {
+                NodeRef::Manual { manual_id } => {
+                    let n = changed.manual_nodes.iter_mut().find(|n| &n.id == manual_id).unwrap();
+                    let ManualNodeKind::Proxy { raw } = &mut n.kind else { unreachable!() };
+                    raw
+                }
+                NodeRef::Subscription { name, .. } => {
+                    &mut changed.subscriptions[0].nodes.iter_mut().find(|n| &n.name == name).unwrap().raw
+                }
+            };
+            raw["server"] = json!("changed.test");
+            let fresh = delay_hashes(&changed);
+            assert_ne!(fresh["手动/两跳"], hashes["手动/两跳"]);
+            assert_ne!(fresh["出口A"], hashes["出口A"]);
+            let regenerated = gen(&changed);
+            let other = &regenerated.plan.listeners["入口A"];
+            assert_ne!(other.exit_fingerprint, plan.exit_fingerprint);
+            assert_ne!(other.listener_fingerprint, plan.listener_fingerprint);
+        }
+        // Every invalid shape fails closed at resolution even before validation.
+        let mut invalids = vec![vec![], vec![hops[0].clone()], {
+            let mut v = hops.clone();
+            v.push(nref("JP 01")); v
+        }];
+        let mut repeat = hops.clone(); repeat[3] = repeat[1].clone(); invalids.push(repeat);
+        let mut nested = hops; nested[3] = mref("chain"); invalids.push(nested);
+        for invalid in invalids {
+            m.manual_nodes[1].kind = ManualNodeKind::Chain(ProxyChain { hops: invalid });
+            assert!(crate::model::validate(&m).is_err());
+            assert!(resolve(&m, &mref("chain")).is_none());
+            assert!(!gen(&m).plan.listeners.contains_key("入口A"));
+        }
+    }
+
+    #[test]
     fn chain_udp_rules_preserve_precedence_but_replace_proxy_actions_with_reject() {
         let mut m = chain_model();
         m.listeners[0].routing = Some(ListenerRouting {
@@ -1788,6 +1902,10 @@ mod tests {
     #[test]
     fn explicit_chain_rule_rejects_only_its_udp_and_preserves_auxiliary_scope() {
         let mut m = chain_model();
+        m.manual_nodes.push(proxy_manual("first", "手动前置", &[]));
+        m.manual_nodes[1].kind = ManualNodeKind::Chain(ProxyChain {
+            hops: vec![mref("first"), nref("HK 01"), mref("last")],
+        });
         m.exits[0].kind = ExitKind::Direct;
         let process = r"C:\Program Files (x86)\Browser\app.exe";
         m.listeners[0].routing = Some(ListenerRouting {
@@ -1809,7 +1927,9 @@ mod tests {
             "MATCH,__direct_la",
         ]));
         let tail = find(&y, "proxies", "__rule_target_la_0").unwrap();
-        let first = find(&y, "proxies", tail["dialer-proxy"].as_str().unwrap()).unwrap();
+        let middle = find(&y, "proxies", tail["dialer-proxy"].as_str().unwrap()).unwrap();
+        let first = find(&y, "proxies", middle["dialer-proxy"].as_str().unwrap()).unwrap();
+        assert!(middle.get("interface-name").is_none());
         assert_eq!(first["interface-name"], "以太网");
         assert_eq!(find(&y, "listeners", "__fetch__ea").unwrap()["rule"], "__aux_la");
         assert_eq!(y["rules"], seq(&["DOMAIN,unrelated.example,__direct_la", "MATCH,__direct_la"]));
@@ -1861,8 +1981,8 @@ mod tests {
     #[test]
     fn chain_rejects_duplicate_nested_and_non_tcp_hops_and_groups() {
         let mut m = chain_model();
-        let duplicate = ManualNodeKind::Chain { entry: mref("last"), exit: mref("last") };
-        let nested = ManualNodeKind::Chain { entry: mref("chain"), exit: mref("last") };
+        let duplicate = ManualNodeKind::Chain(ProxyChain { hops: vec![mref("last"), mref("last")] });
+        let nested = ManualNodeKind::Chain(ProxyChain { hops: vec![mref("chain"), mref("last")] });
         for kind in [duplicate, nested] {
             m.manual_nodes[1].kind = kind;
             assert!(resolve(&m, &mref("chain")).is_none());

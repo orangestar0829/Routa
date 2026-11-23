@@ -382,7 +382,7 @@ function withChain(base: Model): Model {
     manual_nodes: [
       ...base.manual_nodes.map((n) => n.id === a.manual_id
         ? { ...n, kind: { Proxy: { raw: { type: "http", server: "entry.test", port: 8080 } } } } : n),
-      { id: testedChainRef.manual_id, name: "两跳出口", groups: [], kind: { Chain: { entry: a, exit: b } } },
+      { id: testedChainRef.manual_id, name: "两跳出口", groups: [], kind: { Chain: { hops: [a, b] } } },
     ],
   };
 }

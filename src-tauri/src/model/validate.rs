@@ -288,10 +288,10 @@ fn validate_manual(model: &Model, errors: &mut Vec<ValidationError>) {
                     bad.push("hostname 不能为空");
                 }
             }
-            ManualNodeKind::Chain { entry, exit } => {
-                if entry == exit { bad.push("前置节点与落地节点不能相同"); }
+            ManualNodeKind::Chain(chain) => {
+                if let Some(problem) = chain.shape_problem() { bad.push(problem); }
                 if !n.groups.is_empty() { bad.push("代理链暂不支持加入节点组"); }
-                for hop in [entry, exit] {
+                for hop in &chain.hops {
                     // A subscription is externally mutable. Leave a missing
                     // subscription hop unresolved so unrelated edits and
                     // subscription updates remain possible without retargeting.

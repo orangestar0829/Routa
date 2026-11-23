@@ -30,7 +30,7 @@ export function RouteActionFields({ action, onChange, disabled, error }: {
     {target && <>
       <MemberPicker multiple={false} label="所选出口" value={target.Target.target} disabled={disabled} error={error}
         onChange={(member) => onChange({ Target: { ...target.Target, target: member } })} />
-      {chain && <FormHelperText>代理链仅支持 TCP。两跳可用时，匹配的 UDP 将被阻断。</FormHelperText>}
+      {chain && <FormHelperText>代理链仅支持 TCP。链路可用时，匹配的 UDP 将被阻断。</FormHelperText>}
       <Box sx={{ display: "flex", alignItems: "flex-start", gap: 0.75 }}>
         <TextField select fullWidth label="所选出口不可用时" value={unavailable} disabled={disabled}
           helperText={unavailable === "Direct" ? "选定出口不可用时，流量会绕过代理。" : undefined}

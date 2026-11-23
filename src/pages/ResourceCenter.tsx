@@ -157,7 +157,7 @@ function NodeResources() {
         "Tailscale" in n.kind
           ? "Tailscale"
           : "Chain" in n.kind
-            ? "TCP · 2 跳"
+            ? `TCP · ${n.kind.Chain.hops.length} 跳`
             : String((n.kind.Proxy.raw as Record<string, unknown>)?.type ?? "代理"),
       proxy: `手动/${n.name}`,
       manual: n,

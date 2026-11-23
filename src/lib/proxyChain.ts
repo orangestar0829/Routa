@@ -1,7 +1,12 @@
-import type { JsonValue, ManualNodeKind, Model, NodeRef } from "../bindings";
+import type { JsonValue, Model, NodeRef, ProxyChain } from "../bindings";
 import { isSubRef, nodeKey } from "./refs";
 
-export type ChainHops = Extract<ManualNodeKind, { Chain: unknown }>["Chain"];
+export const MIN_CHAIN_HOPS = 2;
+export const MAX_CHAIN_HOPS = 8;
+
+export function hopRole(index: number, length: number): string {
+  return index === 0 ? "前置节点" : index === length - 1 ? "落地节点" : "中转节点";
+}
 
 const CHAIN_PROTOCOLS = new Set(["http", "socks5", "ss", "vmess", "vless", "trojan"]);
 const CHAIN_TRANSPORTS = new Set(["", "tcp", "ws", "grpc", "http", "h2", "httpupgrade"]);
@@ -39,11 +44,9 @@ export function canBeChainHop(model: Model, ref: NodeRef): boolean {
   return !!node && "Proxy" in node.kind && eligibleRaw(node.kind.Proxy.raw);
 }
 
-export function chainProblem(model: Model, hops: ChainHops): string | undefined {
-  const entry = canBeChainHop(model, hops.entry);
-  const exit = canBeChainHop(model, hops.exit);
-  if (!entry && !exit) return "两跳均不可用";
-  if (!entry) return "前置节点不可用";
-  if (!exit) return "落地节点不可用";
-  if (nodeKey(hops.entry) === nodeKey(hops.exit)) return "两跳不能相同";
+export function chainProblem(model: Model, { hops }: ProxyChain): string | undefined {
+  if (hops.length < MIN_CHAIN_HOPS || hops.length > MAX_CHAIN_HOPS) return "代理链必须包含 2 到 8 跳";
+  const missing = hops.findIndex((hop) => !canBeChainHop(model, hop));
+  if (missing >= 0) return `第 ${missing + 1} 跳${hopRole(missing, hops.length)}不可用`;
+  if (new Set(hops.map(nodeKey)).size !== hops.length) return "代理链不能重复使用同一节点";
 }

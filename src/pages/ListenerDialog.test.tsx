@@ -128,7 +128,7 @@ describe("ListenerDialog V4.3", () => {
       manual_nodes: [
         { id: "main", name: "默认节点", groups: [], kind: { Proxy: { raw: { type: "http", server: "first.example", port: 8000 } } } },
         { id: "p2", name: "独立节点", groups: [], kind: { Proxy: { raw: { type: "socks5", server: "last.example", port: 1080 } } } },
-        { id: "chain", name: "两跳出口", groups: [], kind: { Chain: { entry: { manual_id: "main" }, exit: { manual_id: "p2" } } } },
+        { id: "chain", name: "两跳出口", groups: [], kind: { Chain: { hops: [{ manual_id: "main" }, { manual_id: "p2" }] } } },
       ],
     });
     renderDialog(listener);

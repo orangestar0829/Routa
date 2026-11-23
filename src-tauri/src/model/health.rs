@@ -51,7 +51,7 @@ pub(crate) fn exit_health(model: &Model, exit: &Exit, nics: &[NetInterface]) -> 
         }
         ExitKind::Group { members, .. } => {
             // A persisted invalid assignment must not silently fail over
-            // from a fixed two-hop chain to another group's member.
+            // from a fixed proxy chain to another group's member.
             if members.iter().any(|m| member_has_chain(model, m)) {
                 (vec![], members.clone())
             } else {

@@ -454,7 +454,7 @@ const tcpChainModel: Model = {
     kind: { Proxy: { raw: { type: "socks5", server: "exit.test", port: "1080" } } },
   }, {
     id: "other-chain", name: "现有代理链", groups: [],
-    kind: { Chain: { entry: entryRef, exit: exitRef } },
+    kind: { Chain: { hops: [entryRef, exitRef] } },
   }, {
     id: "plugin-alias", name: "插件大小写别名", groups: [],
     kind: { Proxy: { raw: { type: "ss", server: "udp.test", port: 443, Plugin: "kcptun" } } },
@@ -503,7 +503,7 @@ it("adds a chain with fixed, typed entry and exit without offering unsupported h
   expect(screen.queryByRole("option", { name: "插件大小写别名" })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("option", { name: "前置来源" }));
   await pickHop(/落地节点/, "前置来源");
-  expect(screen.getByText("前置和落地节点不能相同。")).toBeInTheDocument();
+  expect(screen.getByText("与第 1 跳重复，请选择不同的节点。")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
   fireEvent.click(screen.getByRole("combobox", { name: /落地节点/ }));
   fireEvent.change(screen.getByRole("combobox", { name: /落地节点/ }), { target: { value: "" } });
@@ -511,7 +511,7 @@ it("adds a chain with fixed, typed entry and exit without offering unsupported h
   fireEvent.click(screen.getByRole("button", { name: "保存" }));
   await waitFor(() => expect(commands.saveManualNode).toHaveBeenCalledWith({
     id: expect.any(String), name: "双跳测试", groups: [],
-    kind: { Chain: { entry: entryRef, exit: exitRef } },
+    kind: { Chain: { hops: [entryRef, exitRef] } },
   }));
 });
 
@@ -527,7 +527,7 @@ it("shows a missing subscription hop on its card and retains stable identity whe
     }],
   });
   const card = await screen.findByRole("article", { name: "现有代理链" });
-  expect(within(card).getByText("前置节点不可用")).toBeInTheDocument();
+  expect(within(card).getByText("第 1 跳前置节点不可用")).toBeInTheDocument();
   fireEvent.click(within(card).getByRole("button", { name: "操作 现有代理链" }));
   expect(screen.getByRole("menuitem", { name: "测延迟 现有代理链" })).toHaveAttribute("aria-disabled", "true");
   fireEvent.click(screen.getByRole("menuitem", { name: "编辑 现有代理链" }));
@@ -539,6 +539,59 @@ it("shows a missing subscription hop on its card and retains stable identity whe
   fireEvent.click(screen.getByRole("button", { name: "保存" }));
   await waitFor(() => expect(commands.saveManualNode).toHaveBeenCalledWith({
     id: "other-chain", name: "现有代理链", groups: [],
-    kind: { Chain: { entry: replacementRef, exit: exitRef } },
+    kind: { Chain: { hops: [replacementRef, exitRef] } },
   }));
+});
+
+it("adds, reorders and deletes hops without changing the saved node identity", async () => {
+  const middleRef = { manual_id: "middle" };
+  vi.mocked(commands.saveManualNode).mockClear();
+  vi.mocked(commands.saveManualNode).mockResolvedValue({ status: "ok", data: { Reloaded: { cut: 0, uncut: 0, failed_listeners: [] } } });
+  setup(false, "/nodes", {
+    ...tcpChainModel, manual_nodes: [...tcpChainModel.manual_nodes, {
+      ...tcpChainModel.manual_nodes[0], id: middleRef.manual_id, name: "中转候选",
+    }],
+  });
+  const card = await screen.findByRole("article", { name: "现有代理链" });
+  fireEvent.click(within(card).getByRole("button", { name: "操作 现有代理链" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "编辑 现有代理链" }));
+  const editor = within(await screen.findByRole("dialog"));
+  const preview = editor.getByLabelText("链路预览");
+  expect(preview).toHaveTextContent("前置来源 → 落地候选");
+  expect(editor.getByRole("button", { name: "删除第 1 跳" })).toBeDisabled();
+  expect(editor.getByRole("button", { name: "上移第 1 跳" })).toBeDisabled();
+  fireEvent.click(editor.getByRole("button", { name: "添加一跳" }));
+  expect(editor.getByRole("button", { name: "保存" })).toBeDisabled();
+  await pickHop(/落地节点（第 3 跳）/, "中转候选");
+  fireEvent.click(editor.getByRole("button", { name: "上移第 3 跳" }));
+  expect(editor.getByRole("combobox", { name: "中转节点（第 2 跳）" })).toHaveValue("中转候选");
+  expect(editor.getByRole("combobox", { name: "落地节点（第 3 跳）" })).toHaveValue("落地候选");
+  expect(preview).toHaveTextContent("前置来源 → 中转候选 → 落地候选");
+  fireEvent.click(editor.getByRole("button", { name: "下移第 1 跳" }));
+  expect(preview).toHaveTextContent("中转候选 → 前置来源 → 落地候选");
+  fireEvent.click(editor.getByRole("button", { name: "上移第 2 跳" }));
+  fireEvent.click(editor.getByRole("button", { name: "添加一跳" }));
+  fireEvent.click(editor.getByRole("button", { name: "删除第 4 跳" }));
+  expect(editor.getAllByRole("combobox")).toHaveLength(3);
+  fireEvent.click(editor.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(commands.saveManualNode).toHaveBeenCalledWith({
+    id: "other-chain", name: "现有代理链", groups: [], kind: { Chain: { hops: [entryRef, middleRef, exitRef] } },
+  }));
+});
+
+it("starts at two rows, enforces the eight-hop bound and keeps the final row the exit", async () => {
+  setup(false, "/nodes", tcpChainModel);
+  fireEvent.click(await screen.findByRole("button", { name: "新增" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "新增代理链" }));
+  const editor = within(await screen.findByRole("dialog"));
+  expect(editor.getAllByRole("combobox")).toHaveLength(2);
+  const add = editor.getByRole("button", { name: "添加一跳" });
+  for (let i = 2; i < 8; i++) fireEvent.click(add);
+  expect(editor.getAllByRole("combobox")).toHaveLength(8);
+  expect(editor.getByRole("combobox", { name: "落地节点（第 8 跳）" })).toBeInTheDocument();
+  expect(editor.getByRole("button", { name: "下移第 8 跳" })).toBeDisabled();
+  expect(add).toBeDisabled();
+  fireEvent.click(editor.getByRole("button", { name: "删除第 5 跳" }));
+  expect(add).toBeEnabled();
+  expect(editor.getByRole("combobox", { name: "落地节点（第 7 跳）" })).toBeInTheDocument();
 });

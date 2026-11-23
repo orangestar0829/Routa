@@ -23,7 +23,7 @@ pub struct ChainHop<'a> {
 
 pub fn is_chain_ref(model: &Model, r: &NodeRef) -> bool {
     matches!(r, NodeRef::Manual { manual_id } if model.manual_nodes.iter()
-        .any(|node| &node.id == manual_id && matches!(node.kind, ManualNodeKind::Chain { .. })))
+        .any(|node| &node.id == manual_id && matches!(node.kind, ManualNodeKind::Chain(_))))
 }
 
 pub fn member_has_chain(model: &Model, member: &ExitMember) -> bool {
@@ -31,7 +31,7 @@ pub fn member_has_chain(model: &Model, member: &ExitMember) -> bool {
         ExitMember::Node(r) => is_chain_ref(model, r),
         ExitMember::Group { group: GroupRef::Custom(id) } => {
             model.manual_nodes.iter().any(|n| n.groups.contains(id)
-                && matches!(n.kind, ManualNodeKind::Chain { .. }))
+                && matches!(n.kind, ManualNodeKind::Chain(_)))
                 || model.node_groups.iter().find(|g| &g.id == id)
                     .is_some_and(|g| g.members.iter().any(|r| is_chain_ref(model, r)))
         }
@@ -99,12 +99,18 @@ pub fn resolve_chain_hop<'a>(model: &'a Model, r: &NodeRef) -> Option<ChainHop<'
     supported_tcp_hop(raw).then_some(ChainHop { raw, manual })
 }
 
+/// All hops or none: a missing middle node must never shorten the route.
+pub fn resolve_chain_hops<'a>(model: &'a Model, chain: &ProxyChain) -> Option<Vec<ChainHop<'a>>> {
+    if chain.shape_problem().is_some() { return None; }
+    chain.hops.iter().map(|r| resolve_chain_hop(model, r)).collect()
+}
+
 pub enum Resolved<'a> {
     /// Copyable per exit; base_name = "<订阅>/<节点>" or "手动/<名>".
     /// `manual`: a manual proxy node (gets the manual-node defaults).
     Copyable { base_name: String, raw: &'a serde_json::Value, manual: bool },
     Tailscale { node: &'a ManualNode, opts: &'a TailscaleOpts },
-    Chain { node: &'a ManualNode, entry: ChainHop<'a>, exit: ChainHop<'a> },
+    Chain { node: &'a ManualNode, hops: Vec<ChainHop<'a>> },
 }
 
 pub fn resolve<'a>(model: &'a Model, r: &NodeRef) -> Option<Resolved<'a>> {
@@ -121,10 +127,9 @@ pub fn resolve<'a>(model: &'a Model, r: &NodeRef) -> Option<Resolved<'a>> {
                     Some(Resolved::Copyable { base_name: manual_proxy_name(node), raw, manual: true })
                 }
                 ManualNodeKind::Tailscale(opts) => Some(Resolved::Tailscale { node, opts }),
-                ManualNodeKind::Chain { entry, exit } if entry != exit => Some(Resolved::Chain {
-                    node, entry: resolve_chain_hop(model, entry)?, exit: resolve_chain_hop(model, exit)?,
+                ManualNodeKind::Chain(chain) => Some(Resolved::Chain {
+                    node, hops: resolve_chain_hops(model, chain)?,
                 }),
-                ManualNodeKind::Chain { .. } => None,
             }
         }
     }

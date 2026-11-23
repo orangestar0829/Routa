@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::model::{ListenerId, Model};
+use crate::model::{ListenerId, ManualNodeKind, Model};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, specta::Type)]
 pub struct Bytes {
@@ -24,6 +24,7 @@ pub struct Store {
 }
 
 const STATE_FILE: &str = "state.json";
+const BEFORE_MULTIHOP: &str = "state.before-multihop.json";
 const TRAFFIC_FILE: &str = "traffic.json";
 const CORE_DIR: &str = "mihomo";
 
@@ -49,12 +50,16 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let data = serde_json::to_vec_pretty(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_bytes_atomic(path, &data)
+}
+
+fn write_bytes_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = PathBuf::from(tmp_name);
     let result = (|| {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(&data)?;
+        f.write_all(data)?;
         f.flush()?;
         f.sync_all()?;
         drop(f);
@@ -112,7 +117,43 @@ impl Store {
     pub fn save_model(&self, m: &Model) -> io::Result<()> {
         let mut value = serde_json::to_value(m).map_err(io::Error::other)?;
         value["proxy_layout_version"] = serde_json::json!(1);
-        write_json_atomic(&self.dir.join(STATE_FILE), &value)
+        // Keep the old preview readable until the profile actually uses
+        // more than two hops. IPC always exposes the canonical ordered list.
+        let mut needs_new_reader = false;
+        for (i, node) in m.manual_nodes.iter().enumerate() {
+            if let ManualNodeKind::Chain(chain) = &node.kind {
+                if let [entry, exit] = chain.hops.as_slice() {
+                    value["manual_nodes"][i]["kind"]["Chain"] = serde_json::json!({"entry":entry, "exit":exit});
+                } else {
+                    needs_new_reader = true;
+                }
+            }
+        }
+        if needs_new_reader { self.backup_before_multihop()?; }
+        write_json_atomic(&self.state_path(), &value)
+    }
+
+    /// Called under the same single-writer model save as state.json. A
+    /// failed backup aborts the incompatible save; never replace a backup.
+    fn backup_before_multihop(&self) -> io::Result<()> {
+        let backup = self.dir.join(BEFORE_MULTIHOP);
+        match fs::metadata(&backup) {
+            Ok(info) if info.is_file() => return Ok(()),
+            Ok(_) => return Err(io::Error::other("multi-hop backup path is not a file")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let path = self.state_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let old: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| invalid_data(&path, e))?;
+        let already_ordered = old["manual_nodes"].as_array().into_iter().flatten()
+            .any(|node| node.pointer("/kind/Chain/hops").is_some());
+        if !already_ordered { write_bytes_atomic(&backup, &bytes)?; }
+        Ok(())
     }
 
     pub fn load_totals(&self) -> io::Result<TrafficTotals> {
@@ -148,6 +189,63 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let store = Store::open(td.path().join("data")).unwrap();
         (td, store)
+    }
+
+    #[test]
+    fn legacy_chain_reads_in_order_without_rewriting_or_changing_references() {
+        use serde_json::json;
+        let (_td, store) = open_tmp();
+        let entry = json!({"subscription_id":"s1", "name":"original entry"});
+        let exit = json!({"manual_id":"n3"});
+        let chain_ref = json!({"manual_id":"stable-chain"});
+        let raw = json!({
+            "proxy_layout_version": 1,
+            "manual_nodes":[{"id":"stable-chain", "name":"My chain", "kind":{
+                "Chain":{"entry":entry, "exit":exit}
+            }}],
+            "exits":[{"id":"port-out", "name":"out", "kind":{"Node":{"node":chain_ref}}}],
+            "listeners":[{"id":"listener", "name":"p", "port":7891,"exit":"port-out"}],
+            "shared_rules":[{"enabled":true,"matcher":"Domain","value":"local.test",
+                "action":{"Target":{"target":chain_ref,"unavailable":"Reject"}}}]
+        });
+        let bytes = serde_json::to_vec_pretty(&raw).unwrap();
+        fs::write(store.state_path(), &bytes).unwrap();
+        let mut m = store.load_model().unwrap();
+        assert_eq!(fs::read(store.state_path()).unwrap(), bytes);
+        assert_eq!(serde_json::to_value(&m).unwrap()["manual_nodes"][0]["kind"]["Chain"], json!({"hops":[entry, exit]}));
+        store.save_model(&m).unwrap();
+        assert_eq!(store.load_model().unwrap(), m);
+        let pair_bytes = fs::read(store.state_path()).unwrap();
+        let pair: serde_json::Value = serde_json::from_slice(&pair_bytes).unwrap();
+        assert_eq!(pair["manual_nodes"][0]["kind"], raw["manual_nodes"][0]["kind"]);
+        let backup = store.dir.join(BEFORE_MULTIHOP);
+        assert!(!backup.exists(), "two-hop-only save stays readable without migration");
+        let chain = &mut m.manual_nodes[0];
+        assert_eq!(chain.id.0, "stable-chain");
+        let ManualNodeKind::Chain(c) = &mut chain.kind else { panic!("lost chain") };
+        assert_eq!(serde_json::to_value(&c.hops).unwrap(), json!([entry, exit]));
+        c.hops.insert(1, serde_json::from_value(json!({"manual_id":"n2"})).unwrap());
+        // If the pre-multihop snapshot can't be made, the old state survives.
+        fs::create_dir(&backup).unwrap();
+        assert!(store.save_model(&m).is_err());
+        assert_eq!(fs::read(store.state_path()).unwrap(), pair_bytes);
+        fs::remove_dir(&backup).unwrap();
+        store.save_model(&m).unwrap();
+        let saved: serde_json::Value = read_json(&store.state_path()).unwrap().unwrap();
+        assert_eq!(saved["manual_nodes"][0]["kind"]["Chain"], json!({"hops":[entry, {"manual_id":"n2"}, exit]}));
+        assert_eq!(saved["exits"][0]["kind"]["Node"]["node"], chain_ref);
+        assert_eq!(saved["listeners"][0]["exit"], "port-out");
+        assert_eq!(saved["shared_rules"], raw["shared_rules"]);
+        assert_eq!(store.load_model().unwrap(), m);
+        assert_eq!(fs::read(&backup).unwrap(), pair_bytes);
+        m.manual_nodes[0].name = "new name".into();
+        store.save_model(&m).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), pair_bytes, "never overwrite the rollback copy");
+        for ambiguous in [
+            json!({"entry":entry}), json!({"hops":[entry, exit],"entry":entry,"exit":exit}),
+        ] {
+            assert!(serde_json::from_value::<ManualNodeKind>(json!({"Chain":ambiguous})).is_err());
+        }
     }
 
     #[test]
