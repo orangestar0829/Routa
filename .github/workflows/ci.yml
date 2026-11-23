@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, feat/shared-routing-rules, feat/extended-routing-rules, feat/proxy-chain]
+    branches: [main, feat/shared-routing-rules, feat/extended-routing-rules, feat/proxy-chain, feat/dns-diversion]
   workflow_dispatch:
 
 permissions:
@@ -57,7 +57,13 @@ jobs:
             ((github.base_ref == 'main' && github.head_ref == 'feat/shared-routing-rules') ||
              (github.base_ref == 'feat/shared-routing-rules' && github.head_ref == 'feat/extended-routing-rules') ||
              (github.base_ref == 'feat/extended-routing-rules' && github.head_ref == 'feat/proxy-chain') ||
-             (github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion')) }}
+             (github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') ||
+             (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
+      ROUTA_MANUAL_TUN_PREVIEW: >-
+        ${{ github.repository == 'orangestar0829/Routa' &&
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -90,22 +96,38 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --workspace
       - name: Export DNS fixtures from the Windows-tested generator
-        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion' }}
+        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
         env:
           ROUTA_DNS_FIXTURE_DIR: ${{ runner.temp }}\routa-dns-fixtures
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib config_gen::dns_fixtures::protected_dns_fixture_snapshot_and_optional_export -- --exact
       - name: Validate generated DNS config with the Windows Mihomo binary
-        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion' }}
+        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
         run: |
           $fixtures = Join-Path $env:RUNNER_TEMP 'routa-dns-fixtures'
           $homeDir = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'routa-dns-core')
           $core = (Resolve-Path 'src-tauri/binaries/mihomo-x86_64-pc-windows-msvc.exe').Path
-          foreach ($name in @('single.yaml', 'chain.yaml', 'unavailable.yaml')) {
+          $cases = @('single.yaml', 'chain.yaml', 'unavailable.yaml')
+          if ($env:ROUTA_MANUAL_TUN_PREVIEW -eq 'true') {
+            $cases += @('fakeip.yaml', 'fakeip-unavailable.yaml')
+            # Same minimal GeoSiteList (CN -> fixture-cn.test) as
+            # scripts/smoke-mihomo-dns.py. Do not download geodata in smoke tests.
+            $geo = [Convert]::FromHexString('0a190a02434e12130802120f666978747572652d636e2e74657374')
+            [IO.File]::WriteAllBytes((Join-Path $homeDir.FullName 'GeoSite.dat'), $geo)
+          }
+          foreach ($name in $cases) {
             & $core -t -d $homeDir.FullName -f (Join-Path $fixtures $name)
             if ($LASTEXITCODE -ne 0) { throw "Windows Mihomo rejected $name" }
           }
+      - name: Exercise Fake-IP on the Windows Mihomo binary without system capture
+        if: env.ROUTA_MANUAL_TUN_PREVIEW == 'true'
+        timeout-minutes: 2
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP 'routa-dns-fixtures/fakeip.yaml'
+          $core = (Resolve-Path 'src-tauri/binaries/mihomo-x86_64-pc-windows-msvc.exe').Path
+          $geo = Join-Path $env:RUNNER_TEMP 'routa-dns-core/GeoSite.dat'
+          node scripts/smoke-mihomo-fakeip-windows.mjs $core $fixture $geo
       - name: Upload generated DNS fixtures
-        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion' }}
+        if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: routa-generated-dns-fixtures
@@ -128,7 +150,8 @@ jobs:
           ROUTA_SHARED_RULES_PREVIEW: '1'
         run: |
           # No stable app configuration, updater, installer identity, or
-          # process-routing service/driver in this test installation.
+          # process-routing service/driver in this test installation. The DNS
+          # branch alone allows TUN manually, with a preview-only adapter name.
           $config = Join-Path $env:RUNNER_TEMP 'routa-preview.tauri.json'
           @{
             productName = 'routa-preview'
@@ -141,6 +164,7 @@ jobs:
             }
             plugins = @{ updater = @{ endpoints = @() } }
           } | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8 $config
+          if ($env:ROUTA_MANUAL_TUN_PREVIEW -eq 'true') { $env:ROUTA_TUN_PREVIEW = '1' }
           pnpm tauri build --bundles nsis --config $config -- --locked
           if ($LASTEXITCODE -ne 0) { throw "Isolated Windows preview build failed" }
       - name: Verify Windows application
@@ -157,6 +181,10 @@ jobs:
           $expected = $env:ROUTA_PREVIEW_PR -eq 'true'
           if ($info.format -ne 'ROUTA_BUILD_INFO_V1' -or $info.preview -isnot [bool] -or $info.preview -ne $expected) {
             throw "Unexpected application build identity (expected isolated preview=$expected)"
+          }
+          $expectedTun = $env:ROUTA_MANUAL_TUN_PREVIEW -eq 'true'
+          if ($info.tunPreview -isnot [bool] -or $info.tunPreview -ne $expectedTun) {
+            throw "Unexpected application build identity (expected manual TUN preview=$expectedTun)"
           }
       - name: Stage unsigned PR preview packages
         id: preview-packages
@@ -182,6 +210,9 @@ jobs:
             $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($_.Name)"
           } | Set-Content -Encoding ascii (Join-Path $assets.FullName 'SHA256SUMS.txt')
+          $tunPreview = $env:ROUTA_MANUAL_TUN_PREVIEW -eq 'true'
+          $disabled = @('stable updater', 'process-routing service/driver', 'system proxy')
+          if (!$tunPreview) { $disabled += 'TUN takeover' }
           @{
             kind = 'Unsigned Windows PR preview'
             appIdentifier = 'dev.routa.preview'
@@ -189,7 +220,8 @@ jobs:
             testedCommit = $commit
             headCommit = $env:PR_HEAD_SHA
             run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
-            featuresDisabled = @('stable updater', 'process-routing service/driver', 'system proxy/TUN takeover')
+            featuresDisabled = $disabled
+            manualTunPreview = $tunPreview
           } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $assets.FullName 'build-source.json')
           "exe=$(Join-Path $stage.FullName 'routa.exe')" >> $env:GITHUB_OUTPUT
       - name: Smoke and capture the native Routa Windows UI
@@ -210,7 +242,7 @@ jobs:
 
   dns-core:
     name: Isolated Mihomo DNS routing
-    if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion' }}
+    if: ${{ github.repository == 'orangestar0829/Routa' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && ((github.base_ref == 'feat/proxy-chain' && github.head_ref == 'feat/dns-diversion') || (github.base_ref == 'feat/dns-diversion' && github.head_ref == 'feat/tun-fake-ip')) }}
     needs: windows
     runs-on: ubuntu-22.04
     timeout-minutes: 12

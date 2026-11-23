@@ -10,6 +10,7 @@ fn main() {
             "customProtocol": !tauri::is_dev(),
             "sourceSha256": option_env!("ROUTA_GUI_SOURCE_SHA256"),
             "preview": option_env!("ROUTA_SHARED_RULES_PREVIEW").is_some(),
+            "tunPreview": option_env!("ROUTA_SHARED_RULES_PREVIEW").is_some() && option_env!("ROUTA_TUN_PREVIEW").is_some(),
         }));
         return;
     }

@@ -323,6 +323,8 @@ pub struct DnsProtection {
     pub bootstrap_dns: String,
     pub direct_suffixes: Vec<String>,
     pub direct_geosite_cn: bool,
+    /// Reuse this policy with Fake-IP only when the user separately enters TUN.
+    pub tun_fake_ip: bool,
 }
 
 impl DnsProtection {
@@ -339,6 +341,7 @@ impl Default for DnsProtection {
             bootstrap_dns: "https://223.5.5.5/dns-query".into(),
             direct_suffixes: vec![],
             direct_geosite_cn: false,
+            tun_fake_ip: false,
         }
     }
 }
@@ -748,6 +751,8 @@ mod tests {
         let m: Model = serde_json::from_str(json).unwrap();
         assert_eq!(m.settings.delay_test_url, Settings::default().delay_test_url);
         assert_eq!(m.settings.dns_protection, DnsProtection::default());
+        let pre_fake_ip: DnsProtection = serde_json::from_str(r#"{"enabled":true,"proxy_exit":"old"}"#).unwrap();
+        assert!(pre_fake_ip.enabled && !pre_fake_ip.tun_fake_ip);
         assert!(serde_json::to_value(&m.settings).unwrap().get("dns_protection").is_none());
         // A disabled but customized profile survives toggling/round trips.
         let mut settings = m.settings.clone();

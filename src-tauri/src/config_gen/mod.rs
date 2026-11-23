@@ -575,10 +575,10 @@ pub fn nodes_check_config(controller_port: u16, secret: &str, sub: &Subscription
 }
 
 pub fn generate(input: &GenInput) -> Generated {
-    generate_base(input, true)
+    generate_base(input, None)
 }
 
-fn generate_base(input: &GenInput, ordinary: bool) -> Generated {
+fn generate_base(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
     let model = input.model;
 
     // Every subscription node, for the node page's delay tests.
@@ -873,8 +873,9 @@ fn generate_base(input: &GenInput, ordinary: bool) -> Generated {
             (s(name), provider_config[name].clone())
         }).collect());
     }
-    let protected_dns_fingerprint = (ordinary && model.settings.dns_protection.enabled)
-        .then(|| dns::install(&mut root, model, &fingerprints));
+    let dns = &model.settings.dns_protection;
+    let protected_dns_fingerprint = (dns.enabled && (tun_exit.is_none() || dns.tun_fake_ip))
+        .then(|| dns::install(&mut root, input, &fingerprints, tun_exit));
     Generated {
         protected_dns_fingerprint,
         yaml: serde_yaml_ng::to_string(&root).expect("routing config"),
@@ -886,7 +887,7 @@ fn generate_base(input: &GenInput, ordinary: bool) -> Generated {
 /// TUN has its own explicit exit. User listeners keep their per-listener proxy.
 /// An invalid exit is rejected rather than falling back to DIRECT.
 pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Generated {
-    let mut generated = generate_base(input, tun_exit.is_none());
+    let mut generated = generate_base(input, tun_exit);
     let Some(id) = tun_exit else { return generated };
     let mut root: Value = serde_yaml_ng::from_str(&generated.yaml).expect("generated yaml");
     let selected = input
@@ -927,22 +928,24 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
     root["auto-detect-interface"] = Value::Bool(true);
     root["tun"] = map(vec![
         ("enable", Value::Bool(true)),
-        ("device", s("RoutaTun")),
+        ("device", s(crate::TUN_DEVICE_NAME)),
         ("stack", s("gvisor")),
         ("auto-route", Value::Bool(true)),
         ("strict-route", Value::Bool(true)),
         ("auto-detect-interface", Value::Bool(true)),
         ("dns-hijack", Value::Sequence(vec![s("any:53"), s("tcp://any:53")])),
     ]);
-    root["dns"] = map(vec![
-        ("enable", Value::Bool(true)),
-        ("enhanced-mode", s("fake-ip")),
-        ("fake-ip-range", s("198.18.0.1/16")),
-        (
-            "nameserver",
-            Value::Sequence(vec![s("https://1.1.1.1/dns-query"), s("https://8.8.8.8/dns-query")]),
-        ),
-    ]);
+    if generated.protected_dns_fingerprint.is_none() {
+        root["dns"] = map(vec![
+            ("enable", Value::Bool(true)),
+            ("enhanced-mode", s("fake-ip")),
+            ("fake-ip-range", s("198.18.0.1/16")),
+            (
+                "nameserver",
+                Value::Sequence(vec![s("https://1.1.1.1/dns-query"), s("https://8.8.8.8/dns-query")]),
+            ),
+        ]);
+    }
     generated.yaml = serde_yaml_ng::to_string(&root).expect("capture yaml");
     generated
 }

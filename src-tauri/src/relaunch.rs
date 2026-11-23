@@ -91,7 +91,11 @@ fn spawn_elevated(_connect_tun: bool) -> Result<(), String> {
 #[specta::specta]
 pub async fn relaunch_as_admin(app: tauri::AppHandle, connect_tun: bool) -> Result<(), String> {
     if crate::IS_RULES_PREVIEW {
-        return Err("共享规则预览版不会请求管理员权限".into());
+        return Err(if crate::ALLOW_PREVIEW_TUN {
+            "预览版不会自动提权。请先退出，再以管理员身份手动运行；测试前退出其他正在使用 TUN 的客户端。"
+        } else {
+            "共享规则预览版不会请求管理员权限"
+        }.into());
     }
     tokio::task::spawn_blocking(move || spawn_elevated(connect_tun))
         .await

@@ -544,6 +544,9 @@ impl Desktop {
                 self.proxy.enable(l.port)?;
             }
             CaptureMode::Tun => {
+                if crate::ALLOW_PREVIEW_TUN && rt.stable_tun_adapter_ready() {
+                    return Err("检测到正式版的 RoutaTun 正在运行。请先退出正式版及其他 TUN 客户端，再试预览版。".into());
+                }
                 rt.set_tun_exit(l.exit.clone()).await?;
                 for _ in 0..20 {
                     if rt.tun_adapter_ready() {
@@ -625,7 +628,14 @@ impl Desktop {
         listener_override: Option<ListenerId>,
     ) -> Result<DesktopState, String> {
         if crate::IS_RULES_PREVIEW && mode.is_some() {
-            return Err("共享规则预览版仅支持手动配置代理端口，不接管系统流量".into());
+            match mode {
+                Some(CaptureMode::Tun) if crate::ALLOW_PREVIEW_TUN => {
+                    if !is_admin() {
+                        return Err("TUN 测试需要先退出预览版，再以管理员身份手动运行。请勿与正式版或其他 TUN 同时使用。".into());
+                    }
+                }
+                _ => return Err("预览版不支持该接管方式；请手动配置代理端口".into()),
+            }
         }
         let _guard = self.operation.lock().await;
         let previous = *self.active.lock().unwrap();

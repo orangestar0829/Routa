@@ -1421,6 +1421,92 @@ async fn tun_suspends_dns_diversion_using_a_separate_core_and_restores_it() {
 }
 
 #[tokio::test]
+async fn fake_ip_is_armed_without_capture_then_applies_edits_to_running_tun() {
+    let mut model = model_with_dns_exit(false);
+    model.settings.dns_protection.enabled = true;
+    let capture = model.exits[0].id.clone();
+    let h = harness(&model);
+    h.rt.restart_core().await;
+    let ordinary = last_reload(&h.api);
+    let reloads = h.api.reloads.lock().unwrap().len();
+    let mut settings = model.settings;
+    settings.dns_protection.tun_fake_ip = true;
+    h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    assert_eq!(h.launcher.count(), 1);
+    assert_eq!(h.api.reloads.lock().unwrap().len(), reloads); // no implicit takeover or reload
+    assert_eq!(h.launcher.checks.lock().unwrap().len(), 2); // dormant fake-IP profile checked too
+    h.rt.set_tun_exit(Some(capture)).await.unwrap();
+    assert_eq!(h.launcher.count(), 2);
+    assert!(h.launcher.stopped(0));
+    let tun = last_reload(&h.api);
+    assert_eq!(dns_alias_target(&tun).as_deref(), Some("DNS 出口"));
+    assert!(tun.contains("fake-ip-filter"));
+    settings.dns_protection.direct_suffixes.push("lan".into());
+    h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    assert_eq!(h.launcher.count(), 3);
+    assert!(h.launcher.stopped(1));
+    let updated: serde_yaml_ng::Value = serde_yaml_ng::from_str(&last_reload(&h.api)).unwrap();
+    assert_eq!(updated["dns"]["nameserver-policy"]["+.lan"][0], "223.5.5.5");
+
+    // Deactivation must not falsely report success if the old process
+    // cannot be stopped. Retrying the same saved settings must still apply.
+    settings.dns_protection.tun_fake_ip = false;
+    h.launcher.stop_fails.store(true, Ordering::SeqCst);
+    let failed = h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    assert!(matches!(failed, ApplyOutcome::FailedKeptPrevious { .. }));
+    assert_eq!(dns_alias_target(&last_reload(&h.api)).as_deref(), Some("DNS 出口"));
+    h.launcher.stop_fails.store(false, Ordering::SeqCst);
+    h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    let legacy = last_reload(&h.api);
+    assert_eq!(h.launcher.count(), 4);
+    assert!(h.launcher.stopped(2));
+    assert!(dns_alias_target(&legacy).is_none());
+    assert!(legacy.contains("dns-hijack"));
+    assert!(!legacy.contains("fake-ip-filter"));
+
+    settings.dns_protection.tun_fake_ip = true;
+    h.rt.save_settings(settings, |_| Ok(())).await.unwrap();
+    assert_eq!(h.launcher.count(), 5);
+    h.rt.set_tun_exit(None).await.unwrap();
+    assert_eq!(h.launcher.count(), 6);
+    assert!(!last_reload(&h.api).contains("dns-hijack"));
+    assert_eq!(dns_alias_target(&last_reload(&h.api)), dns_alias_target(&ordinary));
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn fake_ip_opt_in_checks_the_saved_exit_even_when_ordinary_dns_was_already_enabled() {
+    let mut model = model_with_dns_exit(false);
+    model.settings.dns_protection.enabled = true;
+    model.exits.retain(|e| e.id.0 != "dns-exit");
+    let h = harness(&model);
+    let mut settings = model.settings;
+    settings.dns_protection.tun_fake_ip = true;
+    assert!(matches!(h.rt.save_settings(settings, |_| Ok(())).await, Err(SettingsSaveError::Validation(_))));
+    assert!(!h.rt.model().settings.dns_protection.tun_fake_ip);
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_fake_ip_tun_entry_restores_the_previous_protected_profile() {
+    let mut model = model_with_dns_exit(false);
+    model.settings.dns_protection.enabled = true;
+    model.settings.dns_protection.tun_fake_ip = true;
+    let capture = model.exits[0].id.clone();
+    let h = harness(&model);
+    h.rt.restart_core().await;
+    reject_next_reload(&h.api);
+    assert!(h.rt.set_tun_exit(Some(capture)).await.is_err());
+    let restored = last_reload(&h.api);
+    assert_eq!(dns_alias_target(&restored).as_deref(), Some("DNS 出口"));
+    assert!(restored.contains("redir-host"));
+    assert!(!restored.contains("dns-hijack"));
+    assert!(h.launcher.stopped(0));
+    assert!(h.launcher.stopped(1));
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
 async fn settings_autostart_failure_keeps_model_and_file_unchanged() {
     let m = model_with_listener(false);
     let h = harness(&m);

@@ -101,6 +101,7 @@ fn fixture(chain: bool, geosite: bool) -> Model {
         bootstrap_dns: "127.0.0.1:31008".into(),
         direct_suffixes: vec!["local.test".into()],
         direct_geosite_cn: geosite,
+        tun_fake_ip: false,
     };
     model
 }
@@ -234,6 +235,85 @@ fn protected_dns_fixture_snapshot_and_optional_export() {
             std::fs::write(dir.join(file), &config.yaml).unwrap();
         }
     }
+
+    // Real production TUN configs (no extra DNS listen address). The wire
+    // smoke substitutes only the capture device with a private test listener.
+    let capture = ExitId("loopback-direct".into());
+    let mut fake = geosite;
+    fake.settings.dns_protection.direct_suffixes.extend(["TrUsTeD.LaN".into(), "printer".into()]);
+    let ordinary = generated(&fake, None);
+    let legacy = generated(&fake, Some(&capture));
+    fake.settings.dns_protection.tun_fake_ip = true;
+    assert_eq!(ordinary, generated(&fake, None), "arming Fake-IP must not affect proxy ports");
+    let mut missing = fake.clone();
+    missing.exits.retain(|e| e.id.0 != DNS_EXIT_ID);
+    for (file, model, chosen) in [("fakeip.yaml", &fake, DNS_EXIT), ("fakeip-unavailable.yaml", &missing, "REJECT")] {
+        let generated = generated(model, Some(&capture));
+        let root = parse(&generated.yaml);
+        let dns = &root["dns"];
+        assert!(generated.protected_dns_fingerprint.is_some());
+        assert_ne!(ordinary.protected_dns_fingerprint, generated.protected_dns_fingerprint);
+        let legacy = parse(&legacy.yaml);
+        for field in ["tun", "rules", "sub-rules", "listeners", "auto-detect-interface"] {
+            assert_eq!(root[field], legacy[field], "{field}");
+        }
+        assert_eq!(outbound(&root, "proxy-groups", DNS_ALIAS).unwrap()["proxies"][0], chosen);
+        assert_eq!(dns["enhanced-mode"], "fake-ip");
+        assert_eq!(dns["fake-ip-range"], "198.18.0.1/16");
+        assert!(dns.get("listen").is_none());
+        assert!(dns.get("direct-nameserver").is_none());
+        assert_eq!(dns["use-system-hosts"], false);
+        assert_eq!(root["hosts"]["+.localhost"], parse("['127.0.0.1', '::1']"));
+        assert_eq!(dns["nameserver-policy"]["+.lan"], parse("['rcode://refused']"));
+        assert_eq!(dns["nameserver-policy"]["+.trusted.lan"], parse("['127.0.0.1:31007']"));
+        assert_eq!(dns["nameserver-policy"]["geosite:cn"], parse("['127.0.0.1:31007']"));
+        assert!(dns["nameserver-policy"].get("node.entry.test").is_none());
+        assert_eq!(dns["proxy-server-nameserver"], parse("['127.0.0.1:31008']"));
+        if chosen == "REJECT" {
+            assert_eq!(dns["fake-ip-filter-mode"], "whitelist");
+            assert_eq!(dns["fake-ip-filter"], parse("[]"));
+        } else {
+            assert_eq!(dns["fake-ip-filter-mode"], "blacklist");
+            let filter = dns["fake-ip-filter"].as_sequence().unwrap();
+            for item in ["node.entry.test", "*", "+.lan", "+.local.test", "+.trusted.lan", "geosite:cn", "www.msftconnecttest.com"] {
+                assert!(filter.contains(&Value::String(item.into())), "{item}");
+            }
+            assert!(!filter.contains(&Value::String("+.node.entry.test".into())));
+        }
+        if let Some(dir) = &dir { std::fs::write(dir.join(file), &generated.yaml).unwrap(); }
+    }
+    fake.settings.dns_protection.enabled = false;
+    assert_eq!(legacy, generated(&fake, Some(&capture)), "the opt-in is inert with DNS diversion off");
+}
+
+#[test]
+fn fake_ip_only_accepts_literal_node_hostnames_and_honors_explicit_lan_suffixes() {
+    let mut model = fixture(true, false);
+    model.settings.dns_protection.tun_fake_ip = true;
+    model.settings.dns_protection.direct_suffixes = vec!["lAn".into(), "ARPA".into(), "notinternal".into()];
+    if let ManualNodeKind::Proxy { raw } = &mut model.manual_nodes[0].kind {
+        raw["server"] = json!("HoP.FqDn.");
+    }
+    let before = generated(&model, Some(&model.exits[0].id));
+    for (i, server) in ["*.invalid", "geosite:us", "+.local", "host,DIRECT", "unrelated.example", "192.0.2.9"].iter().enumerate() {
+        model.manual_nodes.push(node(&format!("n{i}"), &format!("n{i}"), server, 1234).0);
+    }
+    let after = generated(&model, Some(&model.exits[0].id));
+    assert_eq!(before.protected_dns_fingerprint, after.protected_dns_fingerprint);
+    let root = parse(&after.yaml);
+    let exclusions = root["dns"]["fake-ip-filter"].as_sequence().unwrap();
+    assert!(exclusions.contains(&Value::String("hop.fqdn".into())));
+    assert!(exclusions.contains(&Value::String("node.entry.test".into())));
+    for bad in ["*.invalid", "geosite:us", "host,DIRECT", "unrelated.example", "192.0.2.9"] {
+        assert!(!exclusions.contains(&Value::String(bad.into())));
+    }
+    let policy = &root["dns"]["nameserver-policy"];
+    assert_eq!(policy["+.lan"], parse("['127.0.0.1:31007']"));
+    assert!(policy.get("+.home.arpa").is_none()); // explicit ancestor "arpa" wins
+    assert_eq!(policy["+.arpa"], parse("['127.0.0.1:31007']"));
+    assert_eq!(policy["+.internal"], parse("['rcode://refused']"));
+    assert!(policy.get("hop.fqdn").is_none());
+    assert!(policy.get("geosite:cn").is_none());
 }
 
 #[test]
@@ -309,9 +389,9 @@ fn malformed_persisted_dns_policy_never_creates_external_resolvers() {
         DnsProtection { proxy_exit: None, ..valid.clone() },
     ] {
         model.settings.dns_protection = bad;
-        let generated = generated(&model, None);
-        let root = parse(&generated.yaml);
-        assert!(generated.protected_dns_fingerprint.is_some());
+        let ordinary = generated(&model, None);
+        let root = parse(&ordinary.yaml);
+        assert!(ordinary.protected_dns_fingerprint.is_some());
         assert_eq!(
             outbound(&root, "proxy-groups", DNS_ALIAS).unwrap()["proxies"],
             parse("['REJECT']")
@@ -325,6 +405,20 @@ fn malformed_persisted_dns_policy_never_creates_external_resolvers() {
         assert_eq!(dns["fallback"], parse("[]"));
         assert!(dns.get("direct-nameserver").is_none());
         assert!(dns.get("nameserver-policy").is_none());
+        // Hand-edited malformed settings must not introduce any upstream
+        // when the user separately enters TUN; keep TUN but disable synthesis.
+        model.settings.dns_protection.tun_fake_ip = true;
+        let capture = ExitId("loopback-direct".into());
+        let root = parse(&generated(&model, Some(&capture)).yaml);
+        let dns = &root["dns"];
+        assert_eq!(dns["enhanced-mode"], "fake-ip");
+        assert_eq!(dns["fake-ip-filter-mode"], "whitelist");
+        assert_eq!(dns["fake-ip-filter"], parse("[]"));
+        assert_eq!(dns["nameserver"], parse("['rcode://refused']"));
+        assert_eq!(dns["proxy-server-nameserver"], parse("['rcode://refused']"));
+        assert!(dns["nameserver-policy"].as_mapping().unwrap().values()
+            .all(|v| *v == parse("['rcode://refused']")));
+        assert_eq!(outbound(&root, "proxy-groups", DNS_ALIAS).unwrap()["proxies"], parse("['REJECT']"));
     }
 }
 
