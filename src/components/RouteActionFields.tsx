@@ -1,6 +1,9 @@
 import HelpOutline from "@mui/icons-material/HelpOutlineOutlined";
-import { Box, MenuItem, TextField, Tooltip } from "@mui/material";
+import { Box, FormHelperText, MenuItem, TextField, Tooltip } from "@mui/material";
+import { useModel } from "../api/client";
 import type { RuleUnavailable } from "../bindings";
+import { isProxyChain } from "../lib/proxyChain";
+import { isGroupMember } from "../lib/refs";
 import { RULE_ACTIONS, ruleActionKind, targetUnavailable, type DraftRuleAction, type RuleActionKind } from "../lib/sharedRouting";
 import { MemberPicker } from "./MemberPicker";
 
@@ -12,6 +15,9 @@ export function RouteActionFields({ action, onChange, disabled, error }: {
 }) {
   const target = typeof action === "object" ? action : null;
   const unavailable = target ? targetUnavailable(target) : undefined;
+  const model = useModel().data;
+  const member = target?.Target.target;
+  const chain = !!(model && member && !isGroupMember(member) && isProxyChain(model, member));
   return <>
     <TextField select label="处理方式" value={ruleActionKind(action)} disabled={disabled}
       onChange={(e) => {
@@ -24,6 +30,7 @@ export function RouteActionFields({ action, onChange, disabled, error }: {
     {target && <>
       <MemberPicker multiple={false} label="所选出口" value={target.Target.target} disabled={disabled} error={error}
         onChange={(member) => onChange({ Target: { ...target.Target, target: member } })} />
+      {chain && <FormHelperText>代理链仅支持 TCP。链路可用时，匹配的 UDP 将被阻断。</FormHelperText>}
       <Box sx={{ display: "flex", alignItems: "flex-start", gap: 0.75 }}>
         <TextField select fullWidth label="所选出口不可用时" value={unavailable} disabled={disabled}
           helperText={unavailable === "Direct" ? "选定出口不可用时，流量会绕过代理。" : undefined}

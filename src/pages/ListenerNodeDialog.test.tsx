@@ -371,3 +371,33 @@ it("returns an ungrouped node and its membership to the editing form without sav
   expect(commands.saveExit).not.toHaveBeenCalled();
   expect(commands.selectGroupMember).not.toHaveBeenCalled();
 });
+
+const testedChainRef = { manual_id: "tested-chain" };
+function withChain(base: Model): Model {
+  return {
+    ...base,
+    subscriptions: base.subscriptions.map((s) => ({
+      ...s, nodes: s.nodes.map((n) => ({ ...n, raw: { type: "socks5", server: "exit.test", port: 1080 } })),
+    })),
+    manual_nodes: [
+      ...base.manual_nodes.map((n) => n.id === a.manual_id
+        ? { ...n, kind: { Proxy: { raw: { type: "http", server: "entry.test", port: 8080 } } } } : n),
+      { id: testedChainRef.manual_id, name: "两跳出口", groups: [], kind: { Chain: { hops: [a, b] } } },
+    ],
+  };
+}
+
+it("switches a fixed port to a valid chain using its independent manual reference", async () => {
+  setup({}, false, withChain(fixed));
+  fireEvent.click(await screen.findByRole("radio", { name: "两跳出口 · 代理链" }));
+  await waitFor(() => expect(commands.saveExit).toHaveBeenCalledWith({
+    ...fixed.exits[0], kind: { Node: { node: testedChainRef } },
+  }));
+  expect(commands.selectGroupMember).not.toHaveBeenCalled();
+});
+
+it("does not offer a proxy chain as a strategy group member", async () => {
+  setup({}, false, withChain(model));
+  await screen.findByRole("radio", { name: "节点甲 · 手动节点" });
+  expect(screen.queryByRole("radio", { name: "两跳出口 · 代理链" })).not.toBeInTheDocument();
+});

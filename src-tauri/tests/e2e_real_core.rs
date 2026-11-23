@@ -32,10 +32,17 @@ fn refuses(port: u16) -> bool {
 
 /// Tiny HTTP server: answers every request with 204 after `delay`.
 fn spawn_target(delay: Duration) -> u16 {
+    spawn_counted_target(delay).0
+}
+
+fn spawn_counted_target(delay: Duration) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = count.clone();
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for s in l.incoming().flatten() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::spawn(move || {
                 let mut s = s;
                 let mut buf = [0u8; 2048];
@@ -45,7 +52,7 @@ fn spawn_target(delay: Duration) -> u16 {
             });
         }
     });
-    port
+    (port, count)
 }
 
 /// A fake HTTP upstream proxy for routing assertions. It accepts CONNECT
@@ -510,4 +517,297 @@ async fn real_core_two_listeners_direct_exit() {
     assert!(!mihomo_running(&marker), "mihomo should be gone after shutdown");
     assert!(refuses(p1));
     println!("shutdown -> mihomo process gone");
+}
+
+/// A loopback-only CONNECT hop: log the requested authority, forward only to
+/// the expected next socket, and allow tests to refuse a selected hop.
+fn spawn_chain_hop(
+    hop: &'static str,
+    connector: TcpListener,
+    next_port: u16,
+    trace: Arc<Mutex<Vec<(&'static str, String)>>>,
+    available: Arc<std::sync::atomic::AtomicBool>,
+) -> u16 {
+    use std::net::Shutdown;
+    use std::sync::atomic::Ordering;
+
+    let port = connector.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut inbound in connector.incoming().flatten() {
+            let trace = trace.clone();
+            let available = available.clone();
+            std::thread::spawn(move || {
+                let _ = inbound.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut header = Vec::new();
+                for byte in (&mut inbound).bytes().take(8192) {
+                    let Ok(byte) = byte else { return };
+                    header.push(byte);
+                    if header.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&header);
+                let mut parts = text.lines().next().unwrap_or_default().split_whitespace();
+                if parts.next() != Some("CONNECT") {
+                    return;
+                }
+                let authority = parts.next().unwrap_or_default();
+                trace.lock().unwrap().push((hop, authority.to_owned()));
+                if !available.load(Ordering::SeqCst) || authority != format!("127.0.0.1:{next_port}") {
+                    let _ = inbound.write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    return;
+                }
+                let Ok(mut outbound) = TcpStream::connect(("127.0.0.1", next_port)) else { return };
+                let _ = outbound.set_read_timeout(Some(Duration::from_secs(10)));
+                if inbound.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").is_err() {
+                    return;
+                }
+                let (Ok(mut client), Ok(mut server)) = (inbound.try_clone(), outbound.try_clone()) else { return };
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut client, &mut server);
+                    let _ = server.shutdown(Shutdown::Write);
+                });
+                let _ = std::io::copy(&mut outbound, &mut inbound);
+                let _ = inbound.shutdown(Shutdown::Write);
+            });
+        }
+    });
+    port
+}
+
+/// Absolute-form HTTP, avoiding curl's ambient proxy and NO_PROXY variables.
+fn local_http_proxy_status(proxy_port: u16, target_port: u16) -> Option<u16> {
+    use std::io::{BufRead, BufReader};
+
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
+    let target = format!("127.0.0.1:{target_port}");
+    write!(stream, "GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n").ok()?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).ok()?;
+    response.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn spawn_udp_echo() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let packets = Arc::new(Mutex::new(Vec::new()));
+    let observed = packets.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0; 64];
+        while let Ok((len, sender)) = socket.recv_from(&mut buf) {
+            observed.lock().unwrap().push(buf[..len].to_vec());
+            let _ = socket.send_to(&buf[..len], sender);
+        }
+    });
+    (port, packets)
+}
+
+/// The port's SOCKS listener still admits UDP association, so the rule and
+/// its Direct fallback, rather than a blanket inbound guard, are exercised.
+fn local_socks_udp_echo(proxy_port: u16, echo_port: u16, payload: &[u8]) -> bool {
+    use std::io::ErrorKind;
+    use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+    let mut control = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+    control.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    control.write_all(&[5, 1, 0]).unwrap();
+    let mut method = [0; 2];
+    control.read_exact(&mut method).unwrap();
+    assert_eq!(method, [5, 0], "SOCKS server must allow unauthenticated testing");
+
+    let [local_high, local_low] = udp.local_addr().unwrap().port().to_be_bytes();
+    control.write_all(&[5, 3, 0, 1, 127, 0, 0, 1, local_high, local_low]).unwrap();
+    let mut relay = [0; 10];
+    control.read_exact(&mut relay).unwrap();
+    assert_eq!(relay[..4], [5, 0, 0, 1], "expected a local IPv4 UDP relay");
+    let ip = Ipv4Addr::new(relay[4], relay[5], relay[6], relay[7]);
+    let relay_port = u16::from_be_bytes([relay[8], relay[9]]);
+    udp.connect(SocketAddrV4::new(if ip.is_unspecified() { Ipv4Addr::LOCALHOST } else { ip }, relay_port)).unwrap();
+    let [high, low] = echo_port.to_be_bytes();
+    let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1, high, low];
+    packet.extend_from_slice(payload);
+    udp.send(&packet).unwrap();
+
+    let mut reply = [0; 64];
+    match udp.recv(&mut reply) {
+        Ok(len) => {
+            assert_eq!(&reply[..len], packet.as_slice(), "incorrect SOCKS UDP echo");
+            true
+        }
+        Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => false,
+        Err(err) => panic!("wait for UDP relay: {err}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn real_core_chained_proxy_visits_two_hops_in_order_and_never_bypasses() {
+    exercise_chain(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn real_core_three_hops_in_order_and_broken_middle_never_bypasses() {
+    exercise_chain(true).await;
+}
+
+async fn exercise_chain(with_middle: bool) {
+    use routa_lib::model::ProxyChain;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let bin = PathBuf::from(std::env::var("MIHOMO_BIN").expect("set MIHOMO_BIN"));
+    assert!(bin.exists(), "MIHOMO_BIN not found: {bin:?}");
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().to_path_buf()).unwrap();
+    let workdir = store.core_workdir();
+    let _guard = KillOnDrop(tmp.path().file_name().unwrap().to_string_lossy().into_owned());
+
+    let (target, arrivals) = spawn_counted_target(Duration::ZERO);
+    // Reserve the sockets together so parallel real-core tests can't pick the
+    // same port twice during setup. Release the core's sockets right at start.
+    let reserve = || TcpListener::bind("127.0.0.1:0").unwrap();
+    let (entry_socket, exit_socket, routed_socket, control_socket, ctrl_socket) =
+        (reserve(), reserve(), reserve(), reserve(), reserve());
+    let (routed_port, control_port, ctrl) = (
+        routed_socket.local_addr().unwrap().port(),
+        control_socket.local_addr().unwrap().port(),
+        ctrl_socket.local_addr().unwrap().port(),
+    );
+    let fixed_socket = reserve();
+    let fixed_port = fixed_socket.local_addr().unwrap().port();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let toggle = Arc::new(AtomicBool::new(true));
+    let exit_port = spawn_chain_hop(
+        "exit", exit_socket, target, trace.clone(), Arc::new(AtomicBool::new(true)),
+    );
+    let middle_port = with_middle.then(|| spawn_chain_hop(
+        "middle", reserve(), exit_port, trace.clone(), toggle.clone(),
+    ));
+    let entry_next = middle_port.unwrap_or(exit_port);
+    let entry_port = spawn_chain_hop("entry", entry_socket, entry_next, trace.clone(),
+        if with_middle { Arc::new(AtomicBool::new(true)) } else { toggle.clone() });
+    let http_node = |name: &str, port| ManualNode {
+        id: ManualNodeId::new(),
+        name: name.into(),
+        groups: vec![],
+        kind: ManualNodeKind::Proxy {
+            raw: serde_json::json!({
+                "name": name, "type": "http", "server": "127.0.0.1", "port": port,
+            }),
+        },
+    };
+    let mut nodes = vec![http_node("first hop", entry_port)];
+    if let Some(port) = middle_port { nodes.push(http_node("middle hop", port)); }
+    nodes.push(http_node("last hop", exit_port));
+    let chain = ManualNode {
+        id: ManualNodeId::new(), name: "ordered chain".into(), groups: vec![],
+        kind: ManualNodeKind::Chain(ProxyChain { hops: nodes.iter()
+            .map(|n| NodeRef::Manual { manual_id: n.id.clone() }).collect() }),
+    };
+    let chain_ref = NodeRef::Manual { manual_id: chain.id.clone() };
+    nodes.push(chain);
+    let fixed = Exit {
+        name: "fixed chain".into(), kind: ExitKind::Node { node: chain_ref.clone() }, ..Exit::default()
+    };
+    let control = Exit {
+        id: ExitId::new(),
+        name: "loopback control".into(),
+        kind: ExitKind::Direct,
+        interface: None,
+        hidden: false,
+    };
+    let listener = |name: &str, port, exit_id: ExitId| {
+        let mut listener = Listener::new_default(name.into(), port);
+        listener.listen = "127.0.0.1".into();
+        listener.exit = Some(exit_id);
+        listener
+    };
+    // Explicit "Direct" after the matching route makes accidental fallthrough
+    // observable: the same destination below replies to unproxied traffic.
+    let mut routed_listener = listener("chain port", routed_port, control.id.clone());
+    routed_listener.routing = Some(ListenerRouting {
+        rules: vec![PortRule {
+            matcher: RuleMatch::Ipv4Cidr,
+            value: "127.0.0.1/32".into(),
+            action: RuleAction::Target {
+                target: ExitMember::Node(chain_ref),
+                // Even an explicitly selected, configuration-only fallback
+                // must not reroute live UDP or a failed TCP connection.
+                unavailable: RuleUnavailable::Direct,
+            },
+        }],
+        unmatched: RuleAction::Direct,
+    });
+    let model = Model {
+        exits: vec![control.clone(), fixed.clone()],
+        listeners: vec![routed_listener, listener("control port", control_port, control.id),
+            listener("fixed chain port", fixed_port, fixed.id)],
+        manual_nodes: nodes,
+        settings: Settings { controller_port: ctrl, delay_test_interval_mins: None,
+            delay_test_url: format!("http://127.0.0.1:{target}/"), ..Settings::default() },
+        ..Model::default()
+    };
+    store.save_model(&model).unwrap();
+
+    let launcher_for: LauncherFor = Arc::new(move |_s: &Settings| {
+        Arc::new(ProcessLauncher { bin: bin.clone(), workdir: workdir.clone() }) as Arc<dyn CoreLauncher>
+    });
+    let api_for: ApiFor = Box::new(|port, secret| Arc::new(HttpMihomoApi::new(port, secret)));
+    let (tx, mut rx) = mpsc::channel(1024);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let rt = Runtime::new(
+        store, Arc::new(WindowsInterfaces), launcher_for, api_for, Arc::new(WindowsPortOwners), tx,
+    );
+    drop((routed_socket, control_socket, ctrl_socket, fixed_socket));
+    rt.start().await.expect("start real core with chain");
+    assert_eq!(rt.status().core, CoreState::Running);
+    assert!(rt.status().failed_listeners.is_empty(), "{:?}", rt.status().failed_listeners);
+    let probe = |port| tokio::task::spawn_blocking(move || local_http_proxy_status(port, target));
+
+    assert_eq!(probe(control_port).await.unwrap(), Some(204), "target must really be reachable");
+    assert!(trace.lock().unwrap().is_empty(), "control must not hit either chain hop");
+    let mut expected = vec![("entry", format!("127.0.0.1:{entry_next}"))];
+    if with_middle { expected.push(("middle", format!("127.0.0.1:{exit_port}"))); }
+    expected.push(("exit", format!("127.0.0.1:{target}")));
+    for port in [routed_port, fixed_port] {
+        assert_eq!(probe(port).await.unwrap(), Some(204));
+        assert_eq!(std::mem::take(&mut *trace.lock().unwrap()), expected, "TCP port {port}");
+    }
+    // The Nodes page probes the public chain name, not a private hop or
+    // the plain exit. Some core versions make two URL tests for unified delay.
+    let measured = rt.test_delays(vec!["手动/ordered chain".into()]).await;
+    assert!(measured[0].1.ms.is_some(), "whole-chain delay failed: {measured:?}");
+    let observed = std::mem::take(&mut *trace.lock().unwrap());
+    assert!(!observed.is_empty());
+    assert!(observed.chunks(expected.len()).all(|part| part == expected.as_slice()),
+        "delay probe bypassed a hop: {observed:?}");
+
+    let (echo_port, udp_packets) = spawn_udp_echo();
+    let udp_probe = |port, payload: &'static [u8]| {
+        tokio::task::spawn_blocking(move || local_socks_udp_echo(port, echo_port, payload))
+    };
+    assert!(udp_probe(control_port, b"direct-control").await.unwrap(), "UDP echo must be reachable");
+    assert!(!udp_probe(routed_port, b"chain-must-reject").await.unwrap(),
+        "TCP-only chain rule must reject UDP, not fall through to Direct");
+    assert_eq!(udp_packets.lock().unwrap().as_slice(), &[b"direct-control".to_vec()]);
+
+    trace.lock().unwrap().clear();
+    let before_failure = arrivals.load(Ordering::SeqCst);
+    toggle.store(false, Ordering::SeqCst);
+    assert_ne!(probe(routed_port).await.unwrap(), Some(204), "failed hop must not fall back");
+    {
+        let trace = trace.lock().unwrap();
+        assert!(!trace.is_empty(), "the chain was not attempted");
+        let allowed = &expected[..expected.len() - 1];
+        assert!(trace.iter().any(|hit| hit == allowed.last().unwrap()), "failed hop was not attempted: {trace:?}");
+        assert!(trace.iter().all(|hit| allowed.contains(hit)), "bypassed failed hop: {trace:?}");
+    }
+    assert_eq!(arrivals.load(Ordering::SeqCst), before_failure, "destination received a bypass connection");
+    assert_eq!(probe(control_port).await.unwrap(), Some(204), "destination remains reachable directly");
+    rt.shutdown().await;
 }

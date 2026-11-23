@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::resolve::{expand, resolve};
+use super::resolve::{expand, member_has_chain, resolve};
 use super::types::*;
 use crate::netif::NetInterface;
 
@@ -50,8 +50,14 @@ pub(crate) fn exit_health(model: &Model, exit: &Exit, nics: &[NetInterface]) -> 
             }
         }
         ExitKind::Group { members, .. } => {
-            let e = expand(model, members);
-            (e.nodes, e.missing)
+            // A persisted invalid assignment must not silently fail over
+            // from a fixed proxy chain to another group's member.
+            if members.iter().any(|m| member_has_chain(model, m)) {
+                (vec![], members.clone())
+            } else {
+                let e = expand(model, members);
+                (e.nodes, e.missing)
+            }
         }
         ExitKind::Direct => (vec![], vec![]),
     };

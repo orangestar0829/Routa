@@ -400,11 +400,52 @@ impl Default for TailscaleOpts {
     }
 }
 
+/// Physical nodes in TCP dialing order. Only the final hop is the exit.
+#[derive(Serialize, Clone, Debug, PartialEq, specta::Type)]
+pub struct ProxyChain {
+    pub hops: Vec<NodeRef>,
+}
+
+pub const MIN_CHAIN_HOPS: usize = 2;
+pub const MAX_CHAIN_HOPS: usize = 8;
+
+impl ProxyChain {
+    pub fn shape_problem(&self) -> Option<&'static str> {
+        if !(MIN_CHAIN_HOPS..=MAX_CHAIN_HOPS).contains(&self.hops.len()) {
+            return Some("代理链必须包含 2 到 8 跳");
+        }
+        if self.hops.iter().enumerate().any(|(i, hop)| self.hops[..i].contains(hop)) {
+            return Some("代理链不能重复使用同一节点");
+        }
+        None
+    }
+}
+
+// Older previews persisted {entry, exit}. Decode into the same ordered model:
+// the chain ID and all external references stay intact, no on-open rewrite.
+// Reject mixed representations rather than guessing which route was intended.
+impl<'de> Deserialize<'de> for ProxyChain {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Stored {
+            Ordered { hops: Vec<NodeRef> },
+            Pair { entry: NodeRef, exit: NodeRef },
+        }
+        Ok(Self { hops: match Stored::deserialize(deserializer)? {
+            Stored::Ordered { hops } => hops,
+            Stored::Pair { entry, exit } => vec![entry, exit],
+        } })
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, specta::Type)]
 pub enum ManualNodeKind {
     /// 原样的 mihomo proxy 映射
     Proxy { raw: serde_json::Value },
     Tailscale(TailscaleOpts),
+    /// Ordered TCP route with an independent stable node ID.
+    Chain(ProxyChain),
 }
 
 impl Default for ManualNodeKind {

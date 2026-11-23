@@ -22,12 +22,13 @@ const getOptionLabel = (o: Option) => o.label;
 const isOptionEqualToValue = (a: Option, b: Option) => memberKey(a.member) === memberKey(b.member);
 const getOptionKey = (o: Option) => memberKey(o.member);
 
-type Props = { label?: string; disabled?: boolean; error?: string } & (
+type Props = { label?: string; disabled?: boolean; error?: string; excludeChains?: boolean } & (
   | { multiple?: true; value: ExitMember[]; onChange: (v: ExitMember[]) => void }
   | { multiple: false; value: ExitMember | null; onChange: (v: ExitMember | null) => void }
 );
 
 export function MemberPicker(props: Props) {
+  const { excludeChains = false } = props;
   const model = useModel();
   const status = useStatus();
 
@@ -52,10 +53,11 @@ export function MemberPicker(props: Props) {
       }
     }
     for (const n of m.manual_nodes) {
-      list.push({ member: { manual_id: n.id }, group: MANUAL_GROUP, label: n.name });
+      if (excludeChains && "Chain" in n.kind) continue;
+      list.push({ member: { manual_id: n.id }, group: "Chain" in n.kind ? "代理链" : MANUAL_GROUP, label: n.name });
     }
     return list;
-  }, [model.data]);
+  }, [model.data, excludeChains]);
 
   const optionFor = (mem: ExitMember): Option => {
     const found = options.find((o) => memberKey(o.member) === memberKey(mem));

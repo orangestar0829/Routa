@@ -789,7 +789,11 @@ export type ManualNodeKind =
 /**
  * 原样的 mihomo proxy 映射
  */
-{ Proxy: { raw: JsonValue } } | { Tailscale: TailscaleOpts }
+{ Proxy: { raw: JsonValue } } | { Tailscale: TailscaleOpts } |
+/**
+ * Ordered TCP route with an independent stable node ID.
+ */
+{ Chain: ProxyChain }
 export type Model = { subscriptions: Subscription[]; exits: Exit[]; listeners: Listener[]; settings: Settings; manual_nodes: ManualNode[]; node_groups: NodeGroup[]; process_routing: ProcessRouting; shared_rules?: SharedRule[]; shared_rule_providers?: SharedRuleProvider[] }
 /**
  * Why a target failed a round.
@@ -863,8 +867,8 @@ export type NodeRef = { subscription_id: SubscriptionId; name: string } | { manu
  */
 export type ParsedProxy = { raw: JsonValue; 
 /**
- * Keys removed from the paste, a subset of
- * `["interface-name", "routing-mark", "dialer-proxy"]` in that order.
+ * Keys removed from the paste, grouped by `interface-name`,
+ * `routing-mark`, and `dialer-proxy`, including alternate spellings.
  */
 stripped: string[] }
 export type PortRule = { matcher: RuleMatch; value: string; action: RuleAction }
@@ -928,6 +932,10 @@ export type ProcessRuleId = string
  * frontend can only open these two.
  */
 export type ProjectLink = "Website" | "GitHub"
+/**
+ * Physical nodes in TCP dialing order. Only the final hop is the exit.
+ */
+export type ProxyChain = { hops: NodeRef[] }
 /**
  * Bytes per second.
  */

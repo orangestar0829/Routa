@@ -123,12 +123,26 @@ async function navigate(path) {
     location.hash === target, route)));
 }
 
-async function fill(label, value) {
-  await find("label", label, { input: true, operation: "focus" });
+async function fill(label, value, { partial = false } = {}) {
+  await find(partial ? '[role=dialog] label' : "label", label, { input: true, partial, operation: "focus" });
   await evaluate("document.activeElement.select()");
   await call("Input.insertText", { text: value });
   await wait(label + " input", () => evaluate(expression((expected) =>
     document.activeElement?.value === expected, value)));
+}
+
+async function chooseNamedNode(label, name) {
+  await fill(label, name);
+  const options = '[role=listbox] [role=option]';
+  await wait(`one selectable option named ${name} for ${label}`, () => evaluate(expression((selector, node) => (
+    [...document.querySelectorAll(selector)].filter((el) => el.getClientRects().length &&
+      el.getAttribute("aria-disabled") !== "true" && el.textContent.trim().startsWith(node)).length === 1
+  ), options, name)));
+  await click(options, name, { partial: true });
+  await wait(`selected ${label}: ${name}`, async () => {
+    const state = await evaluate(expression(locate, '[role=dialog] label', label, false, true));
+    return state?.value === name && state.expanded === "false";
+  });
 }
 
 async function pointerClick({ x, y }) {
@@ -170,18 +184,22 @@ async function addLoopbackNode(name, port) {
   await text(name);
 }
 
-async function addProcessRule({ executable, node, unavailable, screenshot }) {
+async function addProcessRule({ executable, node, unavailable, screenshot, expectChain = false }) {
   await click("button", "新增规则");
   await text("新增共享规则");
   await chooseDialogOption("匹配类型", "进程名");
   await fill("匹配内容", executable);
   await chooseDialogOption("处理方式", "指定节点或组");
-  await fill("所选出口", node);
-  await click('[role=option]', node, { partial: true });
-  await wait(`selected outlet ${node}`, () => evaluate(expression((name) => (
-    [...document.querySelectorAll('[role=dialog] input[role=combobox]')]
-      .some((el) => el.value === name && el.getAttribute("aria-expanded") === "false")
-  ), node)));
+  if (expectChain) {
+    await chooseNamedNode("所选出口", node);
+  } else {
+    await fill("所选出口", node);
+    await click('[role=option]', node, { partial: true });
+    await wait(`selected outlet ${node}`, () => evaluate(expression((name) => (
+      [...document.querySelectorAll('[role=dialog] input[role=combobox]')]
+        .some((el) => el.value === name && el.getAttribute("aria-expanded") === "false")
+    ), node)));
+  }
   if (unavailable !== "阻断") {
     await chooseDialogOption("所选出口不可用时", unavailable);
   } else {
@@ -190,10 +208,39 @@ async function addProcessRule({ executable, node, unavailable, screenshot }) {
       expression(locate, select, "所选出口不可用时", false, false),
     ))?.text === "阻断");
   }
+  if (expectChain) await text("代理链仅支持 TCP");
   if (screenshot) await capture(screenshot);
   await click("[role=dialog] button", "保存");
   await wait(`${executable} rule editor closed`, () => evaluate('!document.querySelector("[role=dialog]")'));
   await text(executable);
+}
+
+async function addProxyChain(name, entry, middle, exit) {
+  await click('button[aria-haspopup="menu"]', "新增");
+  await click('[role=menuitem]', "新增代理链");
+  await text("新增代理链");
+  await fill("名称", name, { partial: true }); // Required label includes an asterisk.
+  await chooseNamedNode("前置节点（第 1 跳）", entry);
+  await chooseNamedNode("落地节点（第 2 跳）", exit);
+  await click('[role=dialog] button', "添加一跳");
+  await chooseNamedNode("落地节点（第 3 跳）", middle);
+  await click('[role=dialog] button', "上移第 3 跳");
+  await wait("ordered entry → middle → exit preview", () => evaluate(expression((hops) => {
+    const dialog = document.querySelector("[role=dialog]");
+    return dialog?.querySelector('[aria-label="链路预览"]')?.textContent.trim() === hops.join(" → ")
+      && [...dialog.querySelectorAll('input[role=combobox]')].map(el => el.value).join("|") === hops.join("|");
+  }, [entry, middle, exit])));
+  await find('[role=dialog] button', "保存");
+  await capture("07-proxy-chain-editor");
+  await click('[role=dialog] button', "保存");
+  await wait("proxy chain editor closed", () => evaluate('!document.querySelector("[role=dialog]")'));
+  const card = `article[aria-label="${name}"]`;
+  await find(card);
+  await wait("one saved three-hop proxy chain node", () => evaluate(expression((selector) => {
+    const rows = [...document.querySelectorAll(selector)];
+    return rows.length === 1 && rows[0].innerText.includes("代理链") && rows[0].innerText.includes("TCP · 3 跳");
+  }, card)));
+  await capture("08-proxy-chain-node");
 }
 
 async function applySharedRules() {
@@ -380,6 +427,25 @@ try {
   }
   await find('[aria-label="共享规则列表"] tr', "routa-fixture-b.exe", { partial: true });
   await capture("06-process-shared-rules");
+
+  report.stage = "create and reorder a three-hop chain from loopback fixture nodes";
+  await navigate("nodes");
+  await addLoopbackNode("测试中转 C", "31083");
+  const chain = "三跳测试出口";
+  await addProxyChain(chain, "测试出口 A", "测试中转 C", "测试出口 B");
+
+  report.stage = "select the saved chain as one shared rule outlet";
+  await navigate("shared-routing");
+  await addProcessRule({ executable: "routa-fixture-chain.exe", node: chain, unavailable: "阻断",
+    screenshot: "09-proxy-chain-rule-outlet", expectChain: true });
+  await applySharedRules();
+  await navigate("listeners");
+  await navigate("shared-routing");
+  await wait("persisted chain as one rule outlet", () => evaluate(expression((name) => (
+    [...document.querySelectorAll('[aria-label="共享规则列表"] tr')]
+      .some((row) => row.innerText.includes("routa-fixture-chain.exe") &&
+        row.innerText.includes(name) && row.innerText.includes("不可用时阻断"))
+  ), chain)));
   report.stage = "complete";
   report.status = "passed";
 } catch (error) {

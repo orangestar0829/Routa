@@ -122,12 +122,13 @@ describe("ListenerDialog V4.3", () => {
     expect(screen.getByText("共享规则的 GEOSITE 由内核匹配，此处无法离线验证。")).toBeInTheDocument();
     expect(screen.queryByText(/未匹配规则 →/)).not.toBeInTheDocument();
   });
-  it("saves an explicit IPv6 rule outlet while leaving unmatched options unchanged", async () => {
+  it.each([false, true])("saves an explicit IPv6 rule outlet (chain: %s) without changing unmatched options", async (chain) => {
     vi.mocked(commands.getModel).mockResolvedValue({
       ...model,
       manual_nodes: [
-        { id: "main", name: "默认节点", groups: [], kind: { Proxy: { raw: {} } } },
-        { id: "p2", name: "独立节点", groups: [], kind: { Proxy: { raw: {} } } },
+        { id: "main", name: "默认节点", groups: [], kind: { Proxy: { raw: { type: "http", server: "first.example", port: 8000 } } } },
+        { id: "p2", name: "独立节点", groups: [], kind: { Proxy: { raw: { type: "socks5", server: "last.example", port: 1080 } } } },
+        { id: "chain", name: "两跳出口", groups: [], kind: { Chain: { hops: [{ manual_id: "main" }, { manual_id: "p2" }] } } },
       ],
     });
     renderDialog(listener);
@@ -147,7 +148,8 @@ describe("ListenerDialog V4.3", () => {
     expect(screen.getByText("第 1 条端口规则：请选择指定的节点或组")).toBeInTheDocument();
     expect(invoke).not.toHaveBeenCalled();
     fireEvent.mouseDown(screen.getByRole("combobox", { name: "所选出口" }));
-    fireEvent.click(await screen.findByRole("option", { name: "独立节点" }));
+    fireEvent.click(await screen.findByRole("option", { name: chain ? "两跳出口" : "独立节点" }));
+    if (chain) expect(screen.getByText(/匹配的 UDP 将被阻断/)).toBeInTheDocument();
     fireEvent.mouseDown(screen.getByRole("combobox", { name: "未匹配去向" }));
     expect(screen.queryByRole("option", { name: "指定节点或组" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("option", { name: "阻断" }));
@@ -159,7 +161,7 @@ describe("ListenerDialog V4.3", () => {
         l: expect.objectContaining({ routing: {
           unmatched: "Reject",
           rules: [{ matcher: "Ipv6Cidr", value: "2001:db8::/32", action: {
-            Target: { target: { manual_id: "p2" }, unavailable: "Reject" },
+            Target: { target: { manual_id: chain ? "chain" : "p2" }, unavailable: "Reject" },
           } }],
         } }),
       }),

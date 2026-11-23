@@ -161,14 +161,38 @@ fn proxy_copy(raw: &serde_json::Value, name: &str, interface: Option<&str>) -> O
     let Value::Mapping(mut m) = json_to_yaml(raw) else {
         return None;
     };
-    for k in ["interface-name", "routing-mark", "dialer-proxy"] {
-        m.remove(k);
+    remove_proxy_keys(&mut m, &["interface-name", "routing-mark", "dialer-proxy"]);
+    let noncanonical_names: Vec<_> = m.keys().filter(|key| key.as_str().is_some_and(|key| {
+        key != "name" && proxy_option_matches(key, "name")
+    })).cloned().collect();
+    for key in noncanonical_names {
+        m.remove(&key);
     }
     m.insert(s("name"), s(name));
     if let Some(i) = interface {
         m.insert(s("interface-name"), s(i));
     }
     Some(Value::Mapping(m))
+}
+
+/// Match the pinned core's `DefaultKeyReplacer` and ASCII-key EqualFold
+/// aliases. Otherwise, for example, `dialer_proxy` survives sanitization.
+pub(crate) fn proxy_option_matches(key: &str, canonical: &str) -> bool {
+    key.chars().map(|c| match c {
+        '_' => '-',
+        'K' => 'k',
+        'ſ' => 's',
+        c => c.to_ascii_lowercase(),
+    }).eq(canonical.chars())
+}
+
+fn remove_proxy_keys(mapping: &mut Mapping, keys: &[&str]) {
+    let remove: Vec<_> = mapping.keys().filter(|key| key.as_str().is_some_and(|key| {
+        keys.iter().any(|protected| proxy_option_matches(key, protected))
+    })).cloned().collect();
+    for key in remove {
+        mapping.remove(&key);
+    }
 }
 
 /// Manual nodes (proxy and Tailscale) default to `ip-version: dual`; an
@@ -188,6 +212,67 @@ fn manual_defaults(proxy: Option<Value>) -> Option<Value> {
 fn resolved_copy(raw: &serde_json::Value, manual: bool, name: &str, interface: Option<&str>) -> Option<Value> {
     let p = proxy_copy(raw, name, interface);
     if manual { manual_defaults(p) } else { p }
+}
+
+#[derive(Clone, Copy)]
+enum ChainScope<'a> {
+    Base,
+    Exit(&'a str),
+    Rule(&'a str),
+}
+
+impl ChainScope<'_> {
+    fn suffix(self) -> String {
+        let (kind, id) = match self {
+            Self::Base => return "base".into(),
+            Self::Exit(id) => ("exit", id),
+            Self::Rule(id) => ("rule", id),
+        };
+        let encoded: String = id.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("{kind}_{encoded}")
+    }
+}
+
+fn chain_proxies(
+    node: &ManualNode,
+    hops: &[ChainHop<'_>],
+    target_name: &str,
+    scope: ChainScope<'_>,
+    interface: Option<&str>,
+) -> Option<Vec<Value>> {
+    let scope = scope.suffix();
+    let mut previous = None;
+    let mut proxies = Vec::with_capacity(hops.len());
+    for (i, hop) in hops.iter().enumerate() {
+        // Only the terminal copy is addressable as the user's chosen outlet.
+        // Earlier copies use reserved, scope- and position-specific names.
+        let name = if i + 1 == hops.len() { target_name.to_owned() }
+            else { format!("__chain_hop{}_{}_{scope}", i + 1, node.id.0) };
+        let nic = if i == 0 { interface } else { None };
+        let Value::Mapping(mut proxy) = resolved_copy(hop.raw, hop.manual, &name, nic)? else {
+            return None;
+        };
+        remove_proxy_keys(&mut proxy, &["udp", "udp-over-tcp"]);
+        proxy.insert(s("udp"), Value::Bool(false));
+        if let Some(parent) = previous {
+            proxy.insert(s("dialer-proxy"), Value::String(parent));
+        }
+        proxies.push(Value::Mapping(proxy));
+        previous = Some(name);
+    }
+    Some(proxies)
+}
+
+fn chain_exit(model: &Model, exit: &Exit) -> bool {
+    matches!(&exit.kind, ExitKind::Node { node } if is_chain_ref(model, node))
+}
+
+/// mihomo skips a TCP-only outbound during UDP lookup. A transport branch
+/// preserves normal precedence without putting user values inside expressions
+/// (e.g. a literal parenthesis in a Windows process path).
+fn install_udp_subrule(sub_rules: &mut Mapping, rules: &mut Vec<Value>, alias: String, udp_rules: Vec<Value>) {
+    rules.insert(0, s(&format!("SUB-RULE,(NETWORK,udp),{alias}")));
+    sub_rules.insert(s(&alias), Value::Sequence(udp_rules));
 }
 
 /// The instance's own NIC. `None`: configured but absent or unusable, so the
@@ -234,6 +319,23 @@ fn tailscale_def(node: &ManualNode, opts: &TailscaleOpts, nics: &[NetInterface])
     manual_defaults(tailscale_iface(opts, nics).map(|i| tailscale_proxy(node, opts, i)))
 }
 
+fn manual_node_parts(model: &Model, node: &ManualNode, nics: &[NetInterface]) -> Vec<Value> {
+    let name = manual_proxy_name(node);
+    match &node.kind {
+        ManualNodeKind::Proxy { raw } => manual_defaults(proxy_copy(raw, &name, None))
+            .into_iter().collect(),
+        ManualNodeKind::Tailscale(opts) => tailscale_def(node, opts, nics).into_iter().collect(),
+        ManualNodeKind::Chain(_) => {
+            let r = NodeRef::Manual { manual_id: node.id.clone() };
+            match resolve(model, &r) {
+                Some(Resolved::Chain { node, hops }) =>
+                    chain_proxies(node, &hops, &name, ChainScope::Base, None).unwrap_or_default(),
+                _ => vec![],
+            }
+        }
+    }
+}
+
 /// Proxy names (`手动/<名>`) of the Tailscale instances `generate` writes for
 /// this model and adapter list (an instance whose NIC is unusable is skipped).
 pub fn emitted_tailscale_names(model: &Model, nics: &[NetInterface]) -> Vec<String> {
@@ -264,12 +366,17 @@ struct ExitParts {
 }
 
 /// `None` when nothing could be emitted for the exit (treated as not Ok).
-fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface]) -> Option<ExitParts> {
+fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface], scope: ChainScope<'_>) -> Option<ExitParts> {
     let iface = h.interface.as_ref().map(|n| n.mihomo_name.as_str());
     let parts = match &exit.kind {
         ExitKind::Node { .. } => match h.effective_members.first().and_then(|r| resolve(model, r)) {
             Some(Resolved::Copyable { raw, manual, .. }) => ExitParts {
                 proxies: resolved_copy(raw, manual, &exit.name, iface).into_iter().collect(),
+                group: None,
+                shared: vec![],
+            },
+            Some(Resolved::Chain { node, hops }) => ExitParts {
+                proxies: chain_proxies(node, &hops, &exit.name, scope, iface)?,
                 group: None,
                 shared: vec![],
             },
@@ -307,6 +414,7 @@ fn exit_parts(model: &Model, exit: &Exit, h: &ExitHealth, nics: &[NetInterface])
                             names.push(s(&manual_proxy_name(node)));
                         }
                     }
+                    Some(Resolved::Chain { .. }) => return None,
                     None => {}
                 }
             }
@@ -365,7 +473,7 @@ fn rule_target_parts(input: &GenInput<'_>, port_exit: &Exit, alias: &str, target
         Some(Resolved::Tailscale { opts, .. }) => opts.interface == port_exit.interface,
         _ => true,
     });
-    exit_parts(input.model, &exit, &health, input.nics)
+    exit_parts(input.model, &exit, &health, input.nics, ChainScope::Rule(alias))
 }
 
 fn hash_yaml(v: &Value) -> u64 {
@@ -405,15 +513,16 @@ pub fn delay_fingerprints(model: &Model, health: &Health, nics: &[NetInterface])
         }
     }
     for node in &model.manual_nodes {
-        let proxy = match &node.kind {
-            ManualNodeKind::Proxy { raw } => manual_defaults(proxy_copy(raw, &manual_proxy_name(node), None)),
-            ManualNodeKind::Tailscale(opts) => tailscale_def(node, opts, nics),
-        };
-        if let Some(proxy) = proxy { record(manual_proxy_name(node), proxy); }
+        let parts = manual_node_parts(model, node, nics);
+        match parts.as_slice() {
+            [] => {}
+            [single] => record(manual_proxy_name(node), single.clone()),
+            _ => record(manual_proxy_name(node), Value::Sequence(parts)),
+        }
     }
     for exit in &model.exits {
         let Some(h) = health.exits.get(&exit.id).filter(|h| h.status == ExitStatus::Ok) else { continue };
-        let Some(parts) = exit_parts(model, exit, h, nics) else { continue };
+        let Some(parts) = exit_parts(model, exit, h, nics, ChainScope::Exit(&exit.id.0)) else { continue };
         let selected = match &exit.kind { ExitKind::Group { selected, .. } => serde_yaml_ng::to_value(selected).expect("selection serialization"), _ => Value::Null };
         record(exit.name.clone(), map(vec![("config", Value::from(fingerprint(&parts))), ("selected", selected)]));
     }
@@ -472,11 +581,9 @@ pub fn generate(input: &GenInput) -> Generated {
                 .filter_map(move |n| proxy_copy(&n.raw, &node_proxy_name(sub, n), None))
         })
         .collect();
-    // Every manual node; each Tailscale instance exactly once.
-    proxies.extend(model.manual_nodes.iter().filter_map(|n| match &n.kind {
-        ManualNodeKind::Proxy { raw } => manual_defaults(proxy_copy(raw, &manual_proxy_name(n), None)),
-        ManualNodeKind::Tailscale(opts) => tailscale_def(n, opts, input.nics),
-    }));
+    // Base copies for measurement. Each Tailscale instance is emitted once;
+    // each chain emits its entire ordered set of physical hops.
+    proxies.extend(model.manual_nodes.iter().flat_map(|n| manual_node_parts(model, n, input.nics)));
 
     let mut groups = Vec::new();
     let mut selects = Vec::new();
@@ -489,7 +596,7 @@ pub fn generate(input: &GenInput) -> Generated {
         if h.status != ExitStatus::Ok {
             continue;
         }
-        let Some(parts) = exit_parts(model, exit, h, input.nics) else {
+        let Some(parts) = exit_parts(model, exit, h, input.nics, ChainScope::Exit(&exit.id.0)) else {
             continue;
         };
         fingerprints.insert(&exit.id, fingerprint(&parts));
@@ -537,6 +644,7 @@ pub fn generate(input: &GenInput) -> Generated {
         let Some(&fp) = fingerprints.get(&exit.id) else {
             continue;
         };
+        let tcp_only = chain_exit(model, exit);
         let ty = match l.listener_type {
             ListenerType::Mixed => "mixed",
             ListenerType::Http => "http",
@@ -576,8 +684,11 @@ pub fn generate(input: &GenInput) -> Generated {
             let mut effective_providers = Mapping::new();
             let mut effective_targets = Mapping::new();
             let mut has_target_action = false;
+            let mut has_chain_target = false;
             let mut rules = Vec::new();
+            let mut udp_rules = Vec::new();
             let mut auxiliary_rules = Vec::new();
+            let mut auxiliary_udp_rules = Vec::new();
             let mut has_advanced_rule = false;
             for (index, (matcher, value, r_action)) in local.chain(shared).enumerate() {
                 if *matcher == RuleMatch::RuleSet {
@@ -592,10 +703,13 @@ pub fn generate(input: &GenInput) -> Generated {
                     find_process = true;
                 }
                 let mut guard_unsupported_transport = false;
+                let mut route_is_chain = tcp_only && *r_action == RuleAction::Proxy;
                 let target_name = if let RuleAction::Target { target, unavailable } = r_action {
                     has_target_action = true;
                     let route_alias = format!("__rule_target_{}_{index}", l.id.0);
                     if let Some(parts) = rule_target_parts(input, exit, &route_alias, target) {
+                        route_is_chain = matches!(target, ExitMember::Node(node) if is_chain_ref(model, node));
+                        has_chain_target |= route_is_chain;
                         effective_targets.insert(s(&route_alias), Value::from(fingerprint(&parts)));
                         proxies.extend(parts.proxies);
                         groups.extend(parts.group);
@@ -619,35 +733,65 @@ pub fn generate(input: &GenInput) -> Generated {
                 };
                 let keyword = route_keyword(matcher);
                 let line = s(&format!("{keyword},{value},{target_name}"));
+                let udp_line = if route_is_chain {
+                    s(&format!("{keyword},{value},REJECT"))
+                } else {
+                    line.clone()
+                };
                 if advanced_rule(matcher, r_action) {
                     has_advanced_rule = true;
                 } else {
                     auxiliary_rules.push(line.clone());
+                    if tcp_only {
+                        auxiliary_udp_rules.push(udp_line.clone());
+                    }
                 }
                 rules.push(line);
+                udp_rules.push(udp_line);
                 // mihomo skips a matched outbound that cannot transport UDP.
                 // Never let an explicit node/group selection fall through to
                 // a broader or direct rule for that same traffic.
                 if guard_unsupported_transport {
-                    rules.push(s(&format!("{keyword},{value},REJECT")));
+                    let reject = s(&format!("{keyword},{value},REJECT"));
+                    rules.push(reject.clone());
+                    if !route_is_chain {
+                        udp_rules.push(reject);
+                    }
                 }
             }
             let unmatched = l.routing.as_ref().map_or(&RuleAction::Proxy, |routing| &routing.unmatched);
             let fallback = s(&format!("MATCH,{}", basic_action(unmatched)));
+            let udp_fallback = if tcp_only && *unmatched == RuleAction::Proxy {
+                s("MATCH,REJECT")
+            } else {
+                fallback.clone()
+            };
             rules.push(fallback.clone());
+            udp_rules.push(udp_fallback.clone());
             if has_target_action && *unmatched == RuleAction::Proxy {
                 // A TCP-only port default may also be skipped; do not let
                 // mihomo fall back to its unbound built-in DIRECT route.
                 rules.push(s("MATCH,REJECT"));
+                if !tcp_only {
+                    udp_rules.push(s("MATCH,REJECT"));
+                }
+            }
+            if tcp_only || has_chain_target {
+                fingerprint_fields.push(("effective-udp-rules", Value::Sequence(udp_rules.clone())));
+                install_udp_subrule(&mut sub_rules, &mut rules, format!("__udp_port_{}", l.id.0), udp_rules);
             }
             if has_advanced_rule && l.routing.is_some() {
                 // TUN and subscription refresh historically borrow the local
                 // port's rule list. Keep legacy rules for them, but do not let
                 // newly added app/target rules silently change that traffic.
                 auxiliary_rules.push(fallback);
+                if tcp_only {
+                    auxiliary_udp_rules.push(udp_fallback);
+                    install_udp_subrule(&mut sub_rules, &mut auxiliary_rules, format!("__udp_aux_{}", l.id.0), auxiliary_udp_rules);
+                }
                 sub_rules.insert(s(&format!("__aux_{}", l.id.0)), Value::Sequence(auxiliary_rules));
             }
-            if !inherited.is_empty() || has_target_action {
+            if !inherited.is_empty() || has_target_action || tcp_only {
                 fingerprint_fields.push(("effective-rules", Value::Sequence(rules.clone())));
             }
             if !effective_targets.is_empty() {
@@ -659,6 +803,11 @@ pub fn generate(input: &GenInput) -> Generated {
             sub_rules.insert(s(&alias), Value::Sequence(rules));
             entries.push(("rule", s(&alias)));
         } else {
+            if tcp_only && l.listener_type != ListenerType::Http {
+                // Fixed inbound "proxy" mode bypasses the rule matcher.
+                entries.push(("udp", Value::Bool(false)));
+                fingerprint_fields.push(("udp", Value::Bool(false)));
+            }
             entries.push(("proxy", s(&exit.name)));
         }
         let listener_fingerprint = hash_yaml(&map(fingerprint_fields));
@@ -692,13 +841,18 @@ pub fn generate(input: &GenInput) -> Generated {
         });
         let destination = routed.map(|l| ("rule", listener_subrule_name(&sub_rules, l, true)))
             .unwrap_or(("proxy", s(&exit.name)));
-        listeners.push(map(vec![
+        let fixed_chain = destination.0 == "proxy" && chain_exit(model, exit);
+        let mut fetch = vec![
             ("name", s(&format!("__fetch__{}", exit_id.0))),
             ("type", s("mixed")),
             ("listen", s("127.0.0.1")),
             ("port", Value::from(*port)),
             destination,
-        ]));
+        ];
+        if fixed_chain {
+            fetch.push(("udp", Value::Bool(false)));
+        }
+        listeners.push(map(fetch));
     }
 
     let mut root: Value = serde_yaml_ng::from_str(&base_config(model.settings.controller_port, input.secret, proxies, groups, listeners)).expect("generated config");
@@ -722,7 +876,7 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
     let mut generated = generate(input);
     let Some(id) = tun_exit else { return generated };
     let mut root: Value = serde_yaml_ng::from_str(&generated.yaml).expect("generated yaml");
-    let target = input
+    let selected = input
         .model
         .exits
         .iter()
@@ -733,9 +887,8 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
                 .exits
                 .get(&e.id)
                 .is_some_and(|h| h.status == ExitStatus::Ok)
-        })
-        .map(|e| e.name.as_str())
-        .unwrap_or("REJECT");
+        });
+    let target = selected.map(|e| e.name.as_str()).unwrap_or("REJECT");
     // A reserved alias keeps user names (including commas) out of the rule grammar.
     root["proxy-groups"]
         .as_sequence_mut()
@@ -745,7 +898,12 @@ pub fn generate_for_capture(input: &GenInput, tun_exit: Option<&ExitId>) -> Gene
             ("type", s("select")),
             ("proxies", Value::Sequence(vec![s(target)])),
         ]));
-    root["rules"] = Value::Sequence(vec![s("MATCH,__routa_tun__")]);
+    let mut rules = Vec::new();
+    if selected.is_some_and(|e| chain_exit(input.model, e)) {
+        rules.push(s("NETWORK,udp,REJECT"));
+    }
+    rules.push(s("MATCH,__routa_tun__"));
+    root["rules"] = Value::Sequence(rules);
     if let Some(l) = input.model.listeners.iter().find(|l| l.exit.as_ref() == Some(id) && l.routing.is_some()) {
         if let Some(rules) = root.get("sub-rules").and_then(Value::as_mapping)
             .and_then(|sets| sets.get(&listener_subrule_name(sets, l, true))).cloned()
@@ -1544,6 +1702,302 @@ mod tests {
             },
         }
     }
+    fn chain_model() -> Model {
+        let mut m = base();
+        m.manual_nodes.push(proxy_manual("last", "落地", &[]));
+        m.manual_nodes.push(ManualNode {
+            id: ManualNodeId("chain".into()),
+            name: "两跳".into(),
+            groups: vec![],
+            kind: ManualNodeKind::Chain(ProxyChain { hops: vec![nref("HK 01"), mref("last")] }),
+        });
+        m.exits[0].kind = ExitKind::Node { node: mref("chain") };
+        m
+    }
+
+    #[test]
+    fn chain_copies_hops_in_order_and_only_binds_the_first_to_the_interface() {
+        let mut m = chain_model();
+        m.subscriptions[0].nodes[0].raw["DIALER-PROXY"] = json!("untrusted");
+        m.subscriptions[0].nodes[0].raw["interface-name"] = json!("untrusted");
+        m.subscriptions[0].nodes[0].raw["interface_name"] = json!("untrusted");
+        m.subscriptions[0].nodes[0].raw["dialer_proxy"] = json!("DIRECT");
+        m.subscriptions[0].nodes[0].raw["Routing_Mark"] = json!(99);
+        // Unrelated option spellings, credentials and nested header names
+        // are not touched by the protected-key filter.
+        m.subscriptions[0].nodes[0].raw["IP_VERSION"] = json!("dual");
+        let ManualNodeKind::Proxy { raw } = &mut m.manual_nodes[0].kind else { panic!("test fixture") };
+        raw["dialer-proxy"] = json!("untrusted");
+        raw["NAME"] = json!("untrusted");
+        raw["UDP"] = json!(true);
+        raw["udp-over-tcp"] = json!(true);
+        raw["UDP_Over_TCP"] = json!(true);
+        let original = m.clone();
+
+        let g = gen_with(&m, &nics(), &[(ExitId("ea".into()), 9095)]);
+        let y = parse(&g.yaml);
+        let base = find(&y, "proxies", "手动/两跳").unwrap();
+        let route = find(&y, "proxies", "出口A").unwrap();
+        let locate_first = |tail: &Value| find(&y, "proxies", tail["dialer-proxy"].as_str().unwrap()).unwrap();
+        let base_first = locate_first(base);
+        let route_first = locate_first(route);
+        assert_ne!(base_first["name"], route_first["name"]);
+        for first in [base_first, route_first] {
+            assert_eq!(first["server"], "1.1.1.1");
+            assert_eq!(first["IP_VERSION"], "dual");
+            for protected in ["dialer-proxy", "DIALER-PROXY", "dialer_proxy", "routing-mark", "Routing_Mark", "interface_name"] {
+                assert!(first.get(protected).is_none(), "{protected}");
+            }
+        }
+        assert!(base_first.get("interface-name").is_none());
+        assert_eq!(route_first["interface-name"], "以太网");
+        for tail in [base, route] {
+            assert_eq!(tail["server"], "10.0.0.9");
+            assert_eq!(tail["udp"].as_bool(), Some(false));
+            for protected in ["interface-name", "NAME", "UDP", "udp-over-tcp", "UDP_Over_TCP"] {
+                assert!(tail.get(protected).is_none(), "{protected}");
+            }
+        }
+        for name in ["入口A", "__fetch__ea"] {
+            let port = find(&y, "listeners", name).unwrap();
+            assert_eq!(port["proxy"], "出口A");
+            assert_eq!(port["udp"].as_bool(), Some(false));
+        }
+        assert_eq!(m, original, "generation cannot mutate originals");
+
+        let n = nics();
+        let previous = delay_fingerprints(&m, &evaluate(&m, &n), &n);
+        m.subscriptions[0].nodes[0].raw["server"] = json!("192.0.2.5");
+        let latest = delay_fingerprints(&m, &evaluate(&m, &n), &n);
+        assert_ne!(previous["手动/两跳"], latest["手动/两跳"]);
+        assert_ne!(previous["出口A"], latest["出口A"]);
+    }
+
+    #[test]
+    fn ordered_chain_copies_and_hashes_every_hop_in_each_scope() {
+        let mut m = chain_model();
+        // Exercise the upper bound, combining imported and manual nodes. IDs
+        // (not display names) scope private copies of the same physical hops.
+        let mut hops = vec![nref("HK 01")];
+        for i in 2..MAX_CHAIN_HOPS {
+            let id = format!("mid-{i}");
+            let mut node = proxy_manual(&id, &id, &[]);
+            let ManualNodeKind::Proxy { raw } = &mut node.kind else { unreachable!() };
+            raw["port"] = json!(8000 + i);
+            raw["dialer_proxy"] = json!("DIRECT");
+            raw["DIALER-PROXY"] = json!("DIRECT");
+            raw["interface_name"] = json!("not this NIC");
+            raw["UDP_OVER_TCP"] = json!(true);
+            m.manual_nodes.push(node);
+            hops.push(mref(&id));
+        }
+        hops.push(mref("last"));
+        m.manual_nodes[1].kind = ManualNodeKind::Chain(ProxyChain { hops: hops.clone() });
+        m.listeners[0].routing = Some(ListenerRouting {
+            unmatched: RuleAction::Direct,
+            rules: vec![PortRule { matcher: RuleMatch::Domain, value: "local.test".into(),
+                action: target_action(ExitMember::Node(mref("chain")), RuleUnavailable::Reject) }],
+        });
+        assert!(crate::model::validate(&m).is_ok());
+        let n = nics();
+        let before = m.clone();
+        let generated = gen(&m);
+        let y = parse(&generated.yaml);
+        assert_eq!(m, before);
+        let mut private_names = BTreeSet::new();
+        for (target, nic) in [("手动/两跳", None), ("出口A", Some("以太网")), ("__rule_target_la_0", Some("以太网"))] {
+            let mut p = find(&y, "proxies", target).unwrap();
+            for i in (0..MAX_CHAIN_HOPS).rev() {
+                if i < MAX_CHAIN_HOPS - 1 {
+                    let name = p["name"].as_str().unwrap();
+                    assert!(name.starts_with("__chain_hop"));
+                    assert!(private_names.insert(name.to_owned()), "scope collision: {name}");
+                }
+                let expected = resolve_chain_hop(&m, &hops[i]).unwrap().raw;
+                assert_eq!(p["server"].as_str(), expected["server"].as_str());
+                assert_eq!(p["port"].as_u64(), expected["port"].as_u64());
+                assert_eq!(p["interface-name"].as_str(), if i == 0 { nic } else { None });
+                assert_eq!(p["udp"].as_bool(), Some(false));
+                for key in ["dialer_proxy", "DIALER-PROXY", "interface_name", "UDP_OVER_TCP"] {
+                    assert!(p.get(key).is_none(), "unsanitized {key} at hop {i}");
+                }
+                if i > 0 {
+                    p = find(&y, "proxies", p["dialer-proxy"].as_str().unwrap()).unwrap();
+                } else {
+                    assert!(p.get("dialer-proxy").is_none());
+                }
+            }
+        }
+        let delay_hashes = |model: &Model| delay_fingerprints(model, &evaluate(model, &n), &n);
+        let hashes = delay_hashes(&m);
+        let plan = &generated.plan.listeners["入口A"];
+        for hop in &hops {
+            let mut changed = m.clone();
+            let raw = match hop {
+                NodeRef::Manual { manual_id } => {
+                    let n = changed.manual_nodes.iter_mut().find(|n| &n.id == manual_id).unwrap();
+                    let ManualNodeKind::Proxy { raw } = &mut n.kind else { unreachable!() };
+                    raw
+                }
+                NodeRef::Subscription { name, .. } => {
+                    &mut changed.subscriptions[0].nodes.iter_mut().find(|n| &n.name == name).unwrap().raw
+                }
+            };
+            raw["server"] = json!("changed.test");
+            let fresh = delay_hashes(&changed);
+            assert_ne!(fresh["手动/两跳"], hashes["手动/两跳"]);
+            assert_ne!(fresh["出口A"], hashes["出口A"]);
+            let regenerated = gen(&changed);
+            let other = &regenerated.plan.listeners["入口A"];
+            assert_ne!(other.exit_fingerprint, plan.exit_fingerprint);
+            assert_ne!(other.listener_fingerprint, plan.listener_fingerprint);
+        }
+        // Every invalid shape fails closed at resolution even before validation.
+        let mut invalids = vec![vec![], vec![hops[0].clone()], {
+            let mut v = hops.clone();
+            v.push(nref("JP 01")); v
+        }];
+        let mut repeat = hops.clone(); repeat[3] = repeat[1].clone(); invalids.push(repeat);
+        let mut nested = hops; nested[3] = mref("chain"); invalids.push(nested);
+        for invalid in invalids {
+            m.manual_nodes[1].kind = ManualNodeKind::Chain(ProxyChain { hops: invalid });
+            assert!(crate::model::validate(&m).is_err());
+            assert!(resolve(&m, &mref("chain")).is_none());
+            assert!(!gen(&m).plan.listeners.contains_key("入口A"));
+        }
+    }
+
+    #[test]
+    fn chain_udp_rules_preserve_precedence_but_replace_proxy_actions_with_reject() {
+        let mut m = chain_model();
+        m.listeners[0].routing = Some(ListenerRouting {
+            unmatched: RuleAction::Proxy,
+            rules: vec![
+                PortRule { matcher: RuleMatch::Domain, value: "direct.example".into(), action: RuleAction::Direct },
+                PortRule { matcher: RuleMatch::DomainSuffix, value: "example".into(), action: RuleAction::Proxy },
+                PortRule { matcher: RuleMatch::Domain, value: "shadow.example".into(), action: RuleAction::Direct },
+            ],
+        });
+        let y = parse(&gen(&m).yaml);
+        assert_eq!(y["sub-rules"]["__port_la"], seq(&[
+            "SUB-RULE,(NETWORK,udp),__udp_port_la",
+            "DOMAIN,direct.example,__direct_la",
+            "DOMAIN-SUFFIX,example,__target_la",
+            "DOMAIN,shadow.example,__direct_la",
+            "MATCH,__target_la",
+        ]));
+        assert_eq!(y["sub-rules"]["__udp_port_la"], seq(&[
+            "DOMAIN,direct.example,__direct_la",
+            "DOMAIN-SUFFIX,example,REJECT",
+            "DOMAIN,shadow.example,__direct_la",
+            "MATCH,REJECT",
+        ]));
+
+        let n = nics();
+        let h = evaluate(&m, &n);
+        let capture = generate_for_capture(&GenInput { model: &m, health: &h, secret: "sekret", fetch_listeners: &[], nics: &n }, Some(&m.exits[0].id));
+        assert_eq!(parse(&capture.yaml)["rules"], y["sub-rules"]["__port_la"]);
+    }
+
+    #[test]
+    fn explicit_chain_rule_rejects_only_its_udp_and_preserves_auxiliary_scope() {
+        let mut m = chain_model();
+        m.manual_nodes.push(proxy_manual("first", "手动前置", &[]));
+        m.manual_nodes[1].kind = ManualNodeKind::Chain(ProxyChain {
+            hops: vec![mref("first"), nref("HK 01"), mref("last")],
+        });
+        m.exits[0].kind = ExitKind::Direct;
+        let process = r"C:\Program Files (x86)\Browser\app.exe";
+        m.listeners[0].routing = Some(ListenerRouting {
+            unmatched: RuleAction::Direct,
+            rules: vec![
+                PortRule { matcher: RuleMatch::ProcessPath, value: process.into(), action: target_action(ExitMember::Node(mref("chain")), RuleUnavailable::Reject) },
+                PortRule { matcher: RuleMatch::Domain, value: "unrelated.example".into(), action: RuleAction::Direct },
+            ],
+        });
+        let n = nics();
+        let h = evaluate(&m, &n);
+        let fetch = [(m.exits[0].id.clone(), 9095)];
+        let y = parse(&generate_for_capture(&GenInput { model: &m, health: &h, secret: "test", fetch_listeners: &fetch, nics: &n }, Some(&m.exits[0].id)).yaml);
+        assert_eq!(y["sub-rules"]["__port_la"][0], "SUB-RULE,(NETWORK,udp),__udp_port_la");
+        assert_eq!(y["sub-rules"]["__port_la"][1], format!("PROCESS-PATH,{process},__rule_target_la_0").as_str());
+        assert_eq!(y["sub-rules"]["__udp_port_la"], seq(&[
+            &format!("PROCESS-PATH,{process},REJECT"),
+            "DOMAIN,unrelated.example,__direct_la",
+            "MATCH,__direct_la",
+        ]));
+        let tail = find(&y, "proxies", "__rule_target_la_0").unwrap();
+        let middle = find(&y, "proxies", tail["dialer-proxy"].as_str().unwrap()).unwrap();
+        let first = find(&y, "proxies", middle["dialer-proxy"].as_str().unwrap()).unwrap();
+        assert!(middle.get("interface-name").is_none());
+        assert_eq!(first["interface-name"], "以太网");
+        assert_eq!(find(&y, "listeners", "__fetch__ea").unwrap()["rule"], "__aux_la");
+        assert_eq!(y["rules"], seq(&["DOMAIN,unrelated.example,__direct_la", "MATCH,__direct_la"]));
+        assert_eq!(find(&y, "listeners", "入口B").unwrap()["proxy"], "出口B");
+
+        m.subscriptions[0].nodes.remove(0);
+        let blocked = parse(&gen(&m).yaml);
+        assert_eq!(blocked["sub-rules"]["__port_la"][0], format!("PROCESS-PATH,{process},REJECT").as_str());
+        assert!(find(&blocked, "proxies", "__rule_target_la_0").is_none());
+        let action = &mut m.listeners[0].routing.as_mut().unwrap().rules[0].action;
+        let RuleAction::Target { unavailable, .. } = action else { panic!("test fixture") };
+        *unavailable = RuleUnavailable::Direct;
+        let direct = parse(&gen(&m).yaml);
+        assert_eq!(direct["sub-rules"]["__port_la"][0], format!("PROCESS-PATH,{process},__direct_la").as_str());
+    }
+
+    #[test]
+    fn chain_as_port_default_remains_tcp_only_in_auxiliary_routing() {
+        let mut m = chain_model();
+        m.listeners[0].routing = Some(ListenerRouting {
+            unmatched: RuleAction::Proxy,
+            rules: vec![PortRule { matcher: RuleMatch::DomainKeyword, value: "port-only".into(), action: RuleAction::Direct }],
+        });
+        let n = nics();
+        let h = evaluate(&m, &n);
+        let fetch = [(m.exits[0].id.clone(), 9095)];
+        let y = parse(&generate_for_capture(&GenInput { model: &m, health: &h, secret: "test", fetch_listeners: &fetch, nics: &n }, Some(&m.exits[0].id)).yaml);
+        assert_eq!(y["rules"], seq(&["SUB-RULE,(NETWORK,udp),__udp_aux_la", "MATCH,__target_la"]));
+        assert_eq!(y["sub-rules"]["__udp_aux_la"], seq(&["MATCH,REJECT"]));
+        assert_eq!(find(&y, "listeners", "__fetch__ea").unwrap()["rule"], "__aux_la");
+    }
+
+    #[test]
+    fn chain_fails_closed_when_original_subscription_hop_disappears() {
+        let mut m = chain_model();
+        assert!(crate::model::validate(&m).is_ok());
+        m.subscriptions[0].nodes.remove(0);
+        assert!(crate::model::validate(&m).is_ok(), "an external refresh can remove the hop");
+        let h = evaluate(&m, &nics());
+        assert_eq!(h.exits[&ExitId("ea".into())].status, ExitStatus::NodeMissing);
+        let g = gen(&m);
+        assert!(!g.plan.listeners.contains_key("入口A"));
+        let y = parse(&g.yaml);
+        assert!(find(&y, "proxies", "手动/两跳").is_none());
+        assert!(find(&y, "proxies", "出口A").is_none());
+        assert!(find(&y, "proxies", "机场/JP 01").is_some(), "do not replace the missing hop with this node");
+    }
+
+    #[test]
+    fn chain_rejects_duplicate_nested_and_non_tcp_hops_and_groups() {
+        let mut m = chain_model();
+        let duplicate = ManualNodeKind::Chain(ProxyChain { hops: vec![mref("last"), mref("last")] });
+        let nested = ManualNodeKind::Chain(ProxyChain { hops: vec![mref("chain"), mref("last")] });
+        for kind in [duplicate, nested] {
+            m.manual_nodes[1].kind = kind;
+            assert!(resolve(&m, &mref("chain")).is_none());
+            assert!(crate::model::validate(&m).is_err());
+        }
+        let mut m = chain_model();
+        let ManualNodeKind::Proxy { raw } = &mut m.manual_nodes[0].kind else { panic!("test fixture") };
+        raw["type"] = json!("hysteria2");
+        assert!(resolve(&m, &mref("chain")).is_none());
+        assert!(crate::model::validate(&m).is_err());
+        let mut m = chain_model();
+        m.exits[0].kind = group_kind(vec![ExitMember::Node(mref("chain"))]);
+        assert!(crate::model::validate(&m).is_err());
+    }
+
     fn ts_manual(id: &str, name: &str, groups: &[&str], iface: Option<&str>) -> ManualNode {
         let mut opts = TailscaleOpts::defaults_for(name);
         opts.exit_node = "100.64.0.9".into();

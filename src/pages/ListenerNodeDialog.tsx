@@ -17,6 +17,7 @@ import {
 } from "../api/client";
 import { FormDialog } from "../components/FormDialog";
 import { NodeBrowserGrid, NodeBrowserToolbar, useNodeBrowser } from "../components/NodeBrowser";
+import { isProxyChain } from "../lib/proxyChain";
 import { ungroupedManualNodes } from "../lib/nodeGroups";
 import { expandMembers, nodeKey, nodeLabel } from "../lib/refs";
 import { applyOutcomeMessages } from "../lib/format";
@@ -62,7 +63,7 @@ export function ListenerNodeDialog({
   const available = !!group || !!fixedNode;
   const configuredMembers = m && group ? expandMembers(m, group.members) : [];
   const members = !m ? []
-    : group ? expandMembers(m, [...group.members, ...ungroupedManualNodes(m)])
+    : group ? expandMembers(m, [...group.members, ...ungroupedManualNodes(m)]).filter((ref) => !isProxyChain(m, ref))
     : fixedNode ? expandMembers(m, [
       ...m.subscriptions.map((s): ExitMember => ({ group: { Subscription: s.id } })),
       ...m.manual_nodes.map((n): ExitMember => ({ manual_id: n.id })),
