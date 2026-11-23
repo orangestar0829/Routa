@@ -55,3 +55,18 @@ it("pauses refresh when scrolling back through historical records", () => {
   fireEvent.scroll(screen.getByRole("region", { name: "内核日志列表" }), { target: { scrollTop: 80 } });
   expect(screen.getByRole("button", { name: "继续更新" })).toBeInTheDocument();
 });
+
+it("renders and filters by a named node while keeping raw route IDs in the original log", () => {
+  const raw = 'time="2026-10-30T20:00:01+08:00" level=warning msg="[TCP] dial 代理-abc mihomo --> example.com:443 error: timeout"';
+  render(<LogsPanel text={raw} routes={{ "代理-abc": "落地节点" }}
+    labelsSince={Date.parse("2026-10-30T20:00:00+08:00") / 1000}
+    loading={false} fetching={false} paused={false} onPausedChange={() => {}} onRefresh={() => {}} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "搜索日志消息" }), { target: { value: "落地节点" } });
+  const row = screen.getByRole("button", { name: /展开日志：.*dial 落地节点/ });
+  expect(within(row).queryByText(/代理-abc/)).not.toBeInTheDocument();
+  fireEvent.click(row);
+  const detail = screen.getByRole("region", { name: "日志详情" });
+  expect(within(detail).getByText(/dial 落地节点/)).toBeInTheDocument();
+  fireEvent.click(within(detail).getByText("原始日志"));
+  expect(within(detail).getByText(raw)).toBeVisible();
+});

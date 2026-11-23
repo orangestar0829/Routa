@@ -68,7 +68,7 @@ export function FullOverview() {
             })} />
         </>
       ) : (
-        <LogsPanel text={logs.data ?? ""} loading={logs.isLoading} fetching={logs.isFetching}
+        <LogsPanel text={logs.data?.text ?? ""} routes={logs.data?.routes} leaves={logs.data?.leaves} labelsSince={logs.data?.labels_since} loading={logs.isLoading} fetching={logs.isFetching}
           error={logs.error ? errorMessage(logs.error) : undefined}
           paused={logsPaused} onPausedChange={setLogsPaused} onRefresh={() => void logs.refetch()} />
       )}

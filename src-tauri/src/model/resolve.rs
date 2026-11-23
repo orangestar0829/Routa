@@ -17,6 +17,7 @@ pub fn tailscale_state_dir(id: &ManualNodeId) -> String {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChainHop<'a> {
+    pub name: &'a str,
     pub raw: &'a serde_json::Value,
     pub manual: bool,
 }
@@ -85,18 +86,19 @@ fn supported_tcp_hop(raw: &serde_json::Value) -> bool {
 
 /// Resolve a single ordinary hop without ever recursing into another chain.
 pub fn resolve_chain_hop<'a>(model: &'a Model, r: &NodeRef) -> Option<ChainHop<'a>> {
-    let (raw, manual) = match r {
+    let (raw, name, manual) = match r {
         NodeRef::Subscription { subscription_id, name } => {
             let sub = model.subscriptions.iter().find(|s| &s.id == subscription_id)?;
-            (&sub.nodes.iter().find(|n| &n.name == name)?.raw, false)
+            let node = sub.nodes.iter().find(|n| &n.name == name)?;
+            (&node.raw, node.name.as_str(), false)
         }
         NodeRef::Manual { manual_id } => {
             let node = model.manual_nodes.iter().find(|n| &n.id == manual_id)?;
             let ManualNodeKind::Proxy { raw } = &node.kind else { return None };
-            (raw, true)
+            (raw, node.name.as_str(), true)
         }
     };
-    supported_tcp_hop(raw).then_some(ChainHop { raw, manual })
+    supported_tcp_hop(raw).then_some(ChainHop { raw, name, manual })
 }
 
 /// All hops or none: a missing middle node must never shorten the route.

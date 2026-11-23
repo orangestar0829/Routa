@@ -249,7 +249,7 @@ fn connection_details_use_recorded_leaf_route_and_preserve_slashes_in_node_names
         members: vec![ExitMember::Node(NodeRef::Manual { manual_id: ManualNodeId("m1".into()) })],
         selected: None,
     };
-    let names = connection_node_names(&m);
+    let names = generate_for_capture(&GenInput { model: &m, health: &evaluate(&m, &[]), secret: "test", fetch_listeners: &[], nics: &[] }, None).route_names;
     let mut c = conn("c1", "代理", 1024, 2048);
     c.chains = vec!["机场/手动/香港/家宽01".into(), "机场".into()];
     c.metadata.process = "chrome.exe".into();
@@ -264,9 +264,53 @@ fn connection_details_use_recorded_leaf_route_and_preserve_slashes_in_node_names
     assert_eq!(info.target, "[2001:db8::1]:443");
     assert_eq!(info.uploaded, 1024);
     c.chains = vec!["已删除订阅/旧节点".into(), "机场".into()];
-    assert_eq!(connection_info(c.clone(), &names).node, "已删除订阅/旧节点");
+    let unknown = connection_info(c.clone(), &names);
+    assert!(unknown.node.is_empty(), "don't infer a failed/unknown leaf from its group");
+    assert_eq!(unknown.route.as_deref(), Some("L1 · 策略组"));
+    assert_eq!(unknown.raw_path[0], "已删除订阅/旧节点");
+    c.chains = vec!["机场".into()];
+    let group = connection_info(c.clone(), &names);
+    assert!(group.node.is_empty());
+    assert_eq!(group.route.as_deref(), Some("L1 · 策略组"));
+    let (routes, leaves) = names.logs();
+    assert_eq!(leaves.get("DIRECT").map(String::as_str), Some("直连"));
+    assert_eq!(leaves.get("REJECT").map(String::as_str), Some("阻断"));
+    assert!(routes.contains_key("机场") && !leaves.contains_key("机场"));
+    c.chains = vec!["DIRECT".into(), "机场".into()];
+    let direct = connection_info(c.clone(), &names);
+    assert!(direct.node.is_empty());
+    assert_eq!(direct.route.as_deref(), Some("直连"));
     c.chains.clear();
     assert!(connection_info(c, &names).node.is_empty());
+}
+
+#[test]
+fn shared_group_labels_do_not_guess_a_listener() {
+    use crate::model::{ExitMember, GroupStrategy, Node, NodeRef, Subscription};
+    let mut model = model_with_listener(false);
+    let sub = SubscriptionId("source".into());
+    let mut second = model.listeners[0].clone();
+    second.id = ListenerId("lis-2".into());
+    second.name = "其他端口".into();
+    second.port += 1;
+    model.listeners.push(second);
+    model.subscriptions.push(Subscription {
+        id: sub.clone(), name: "订阅".into(),
+        nodes: vec![Node { name: "节点".into(), server: "127.0.0.1".into(), proxy_type: "http".into(),
+            raw: serde_json::json!({"type": "http", "server": "127.0.0.1", "port": 1080}) }],
+        ..Default::default()
+    });
+    model.exits[0].kind = ExitKind::Group {
+        strategy: GroupStrategy::Fallback, selected: None,
+        members: vec![ExitMember::Node(NodeRef::Subscription { subscription_id: sub, name: "节点".into() })],
+    };
+    for (alias, label) in [("测试组", "测试组 · 策略组"), ("代理-5bc87a98-bedc-493a-bb70-df207816409c", "策略组")] {
+        model.exits[0].name = alias.into();
+        let names = generate_for_capture(&GenInput {
+            model: &model, health: &evaluate(&model, &[]), secret: "test", fetch_listeners: &[], nics: &[],
+        }, None).route_names;
+        assert_eq!(names.get(alias), Some(&RouteName::Route(label.into())));
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -283,11 +327,93 @@ async fn connection_details_keep_the_applied_fixed_node_after_a_rejected_save() 
     c.chains = vec![m.exits[0].name.clone()];
     h.api.set_connections(ConnectionsSnapshot { connections: vec![c], ..Default::default() });
     assert_eq!(h.rt.connection_details().await.unwrap()[0].node, "原节点");
+    let logs = h.rt.core_log_snapshot("原始日志".into());
+    assert_eq!(logs.text, "原始日志");
+    assert_eq!(logs.routes.get(&m.exits[0].name).unwrap(), "原节点");
+    assert_eq!(logs.leaves.get(&m.exits[0].name).unwrap(), "原节点");
+    assert!(logs.labels_since.is_some());
     h.api.reload_results.lock().unwrap().push_back(Err(crate::core::api::ApiError::Rejected { status: 400, message: "bad".into() }));
     let out = h.rt.mutate(|m| m.manual_nodes[0].name = "新节点".into()).await.unwrap();
     assert!(matches!(out, ApplyOutcome::FailedKeptPrevious { .. }), "{out:?}");
     assert_eq!(h.rt.model().manual_nodes[0].name, "新节点");
     assert_eq!(h.rt.connection_details().await.unwrap()[0].node, "原节点");
+    let after_rejection = h.rt.core_log_snapshot(String::new());
+    assert_eq!(after_rejection.routes, logs.routes);
+    assert_eq!(after_rejection.labels_since, logs.labels_since);
+    h.rt.mutate(|_m| {}).await.unwrap();
+    let repointed = h.rt.core_log_snapshot(String::new());
+    let alias = &m.exits[0].name;
+    assert!(!repointed.routes.contains_key(alias) && !repointed.leaves.contains_key(alias));
+    // Outstanding flows/dials can still report the old adapter with the exact
+    // reused alias, so it must not be interpreted as the new node in this core.
+    let lingering = h.rt.connection_details().await.unwrap();
+    assert!(lingering[0].node.is_empty());
+    assert_eq!(&lingering[0].raw_path, &[alias.clone()]);
+    h.rt.mutate(|_m| {}).await.unwrap();
+    assert!(!h.rt.core_log_snapshot(String::new()).routes.contains_key(alias));
+    h.rt.restart_core().await;
+    let fresh = h.rt.core_log_snapshot(String::new());
+    assert_eq!(fresh.routes.get(alias).unwrap(), "新节点");
+    assert_eq!(h.rt.connection_details().await.unwrap()[0].node, "新节点");
+    h.rt.shutdown().await;
+    let stopped = h.rt.core_log_snapshot("仍可读".into());
+    assert!(stopped.routes.is_empty() && stopped.labels_since.is_none());
+    assert_eq!(stopped.text, "仍可读");
+}
+
+#[tokio::test(start_paused = true)]
+async fn fail_closed_retains_aliases_from_a_candidate_that_may_have_run() {
+    let h = harness(&model_with_listener(false));
+    h.rt.restart_core().await;
+    let alias = "候选出口";
+    let node_ref = |id: &str| NodeRef::Manual { manual_id: ManualNodeId(id.into()) };
+    let first = node_ref("candidate");
+    let next = node_ref("next");
+    h.api.select_results.lock().unwrap().push_back(Err(crate::core::api::ApiError::Rejected {
+        status: 400, message: "failed to select candidate group".into(),
+    }));
+    let reloads_before = h.api.reloads.lock().unwrap().len();
+    let out = h.rt.mutate(|model| {
+        for (id, name) in [("candidate", "候选节点"), ("next", "恢复后的节点")] {
+            model.manual_nodes.push(ManualNode {
+                id: ManualNodeId(id.into()), name: name.into(), groups: vec![],
+                kind: ManualNodeKind::Proxy { raw: serde_json::json!({
+                    "name": name, "type": "http", "server": "127.0.0.1", "port": 1080
+                }) },
+            });
+        }
+        model.exits.push(Exit {
+            id: ExitId("candidate-route".into()), name: alias.into(),
+            kind: ExitKind::Node { node: first.clone() }, ..Default::default()
+        });
+        model.exits.push(Exit {
+            id: ExitId("candidate-select".into()), name: "候选组".into(),
+            kind: ExitKind::Group {
+                strategy: GroupStrategy::Select, members: vec![ExitMember::Node(first.clone())],
+                selected: Some(first.clone()),
+            },
+            ..Default::default()
+        });
+    }).await.unwrap();
+    assert!(matches!(out, ApplyOutcome::FailedClosed { .. }), "{out:?}");
+    {
+        let reloads = h.api.reloads.lock().unwrap();
+        assert_eq!(reloads.len(), reloads_before + 2);
+        assert!(reloads[reloads_before].1.contains(alias), "candidate was loaded");
+        assert!(!reloads.last().unwrap().1.contains(alias), "then replaced by empty config");
+    }
+
+    let mut old_candidate = conn("late-candidate-dial", "__fetch__pending", 0, 0);
+    old_candidate.chains = vec![alias.into()];
+    h.api.set_connections(ConnectionsSnapshot { connections: vec![old_candidate], ..Default::default() });
+    let out = h.rt.mutate(|model| {
+        model.exits[1].kind = ExitKind::Node { node: next };
+    }).await.unwrap();
+    assert!(matches!(out, ApplyOutcome::Reloaded { .. }), "{out:?}");
+    assert!(h.rt.connection_details().await.unwrap()[0].node.is_empty());
+    let logs = h.rt.core_log_snapshot(String::new());
+    assert!(!logs.routes.contains_key(alias) && !logs.leaves.contains_key(alias));
+    h.rt.shutdown().await;
 }
 
 fn drain(rx: &mut mpsc::Receiver<RuntimeEvent>) -> Vec<RuntimeEvent> {
@@ -1935,7 +2061,7 @@ async fn restart_clears_reason() {
 
 #[test]
 fn connection_from_hidden_listener_shows_process_routing_label() {
-    let names = HashMap::new();
+    let names = RouteNames::default();
     let c = conn("c1", "__proc_lis-9", 1, 2);
     assert_eq!(connection_info(c, &names).listener, "进程分流");
 }

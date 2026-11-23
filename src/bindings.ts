@@ -515,7 +515,7 @@ async getConnectionDetails() : Promise<Result<ConnectionInfo[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
-async readCoreLog() : Promise<Result<string, string>> {
+async readCoreLog() : Promise<Result<CoreLogSnapshot, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("read_core_log") };
 } catch (e) {
@@ -670,7 +670,9 @@ export type ComponentState = "NotInstalled" | "Stopped" | "Running" |
  * 管道只放行注册组件的用户：组件归其他 Windows 用户所有。
  */
 "OwnedByOtherUser" | { Error: { message: string } }
-export type ConnectionInfo = { id: string; listener: string; process: string; target: string; node: string; protocol: string; uploaded: number; downloaded: number }
+export type ConnectionInfo = { id: string; listener: string; process: string; target: string; node: string; route?: string | null; raw_path?: string[]; protocol: string; uploaded: number; downloaded: number }
+export type CoreLogSnapshot = { text: string; routes: Partial<{ [key in string]: string }>; leaves: Partial<{ [key in string]: string }>; labels_since: number | null }
+
 export type CoreState = "Stopped" | "Starting" | "Running" | { Crashed: { exit_code: number | null } }
 export type CoreStopReason = 
 /**

@@ -34,13 +34,13 @@ mockIPC(async (command) => {
   }
   if (command === "read_core_log") {
     if (params.has("error")) throw "日志文件读取失败";
-    return params.has("empty") ? "" : [
+    return { text: params.has("empty") ? "" : [
       'time="2026-10-29T22:49:09+08:00" level=warning msg="[TCP] dial 机场 127.0.0.1:38501 --> example.com:443 error: i/o timeout\\nretry another address: network unreachable"',
       ...Array.from({ length: 24 }, (_, i) => `time="2026-10-30T20:00:${String(i).padStart(2, "0")}+08:00" level=info msg="已加载代理配置 · 节点 ${i + 1}"`),
       'time="2026-10-30T20:01:00+08:00" level=warning msg="[TCP] dial 机场 127.0.0.1:4001 --> cdn.example.net:443 error: i/o timeout\\ndial tcp 192.0.2.1:443: i/o timeout\\nnetwork unreachable"',
       'time="2026-10-30T20:01:05+08:00" level=error msg="订阅更新失败：请求超时\\nretry failed"',
       'time="2026-10-30T20:02:00+08:00" level=info msg="Initial configuration complete, total time: 11ms"',
-    ].join("\n");
+    ].join("\n"), routes: {}, leaves: {}, labels_since: null };
   }
   if (command.startsWith("plugin:")) return null;
   throw `验收环境未提供命令：${command}`;

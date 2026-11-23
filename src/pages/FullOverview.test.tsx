@@ -18,7 +18,7 @@ beforeEach(() => {
   now = 1000;
   vi.spyOn(performance, "now").mockImplementation(() => now);
   vi.mocked(desktopApi.connections).mockReset().mockResolvedValue(initial);
-  vi.mocked(desktopApi.logs).mockReset().mockResolvedValue("[INFO] 已启动\n[INFO] 真实日志内容");
+  vi.mocked(desktopApi.logs).mockReset().mockResolvedValue({ text: "[INFO] 已启动\n[INFO] 真实日志内容", routes: {}, leaves: {}, labels_since: null });
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -86,7 +86,7 @@ it("refreshes the actual log contents and keeps prior logs visible when refresh 
   mount();
   fireEvent.click(screen.getByRole("tab", { name: "日志" }));
   expect(await screen.findByText(/真实日志内容/)).toBeInTheDocument();
-  vi.mocked(desktopApi.logs).mockResolvedValue("[INFO] 新的日志");
+  vi.mocked(desktopApi.logs).mockResolvedValue({ text: "[INFO] 新的日志", routes: {}, leaves: {}, labels_since: null });
   fireEvent.click(screen.getByRole("button", { name: "刷新" }));
   expect(await screen.findByText("新的日志")).toBeInTheDocument();
   vi.mocked(desktopApi.logs).mockRejectedValue(new Error("日志文件无法读取"));
@@ -117,4 +117,19 @@ it("pauses automatic reads when inspecting a log, while manual refresh remains a
   expect(screen.getByRole("button", { name: "收起日志：真实日志内容" })).toHaveAttribute("aria-expanded", "true");
   fireEvent.click(screen.getByRole("button", { name: "继续更新" }));
   await waitFor(() => expect(desktopApi.logs).toHaveBeenCalledTimes(before + 2));
+});
+
+it("shows the recorded leaf or a friendly route, never an internal connection ID", () => {
+  const rows = [
+    { ...initial[0], node: "落地 [香港]/家宽", route: "两跳 · 代理链：入口 → 落地 [香港]/家宽", raw_path: ["__rule_target_port_1", "__target_port"] },
+    { ...initial[1], node: "", route: "海外 · 策略组", raw_path: ["代理-268bb318-39fb-4175-8baa-f25989f2acfe"] },
+    { ...initial[2], node: "", raw_path: ["__unknown_target"] },
+  ];
+  render(<ConnectionsPanel rows={rows.map((row) => ({ ...row, uploadRate: null, downloadRate: null }))}
+    loading={false} stale={false} grouped={false} onGroupedChange={() => {}}
+    collapsed={new Set()} onCollapse={() => {}} />);
+  expect(screen.getByText("落地 [香港]/家宽")).toHaveAttribute("title", "两跳 · 代理链：入口 → 落地 [香港]/家宽");
+  expect(screen.getByText("海外 · 策略组")).toBeVisible();
+  expect(screen.getByText("节点未确认")).toBeVisible();
+  expect(screen.queryByText(/__rule_target|__unknown_target|代理-268/)).not.toBeInTheDocument();
 });

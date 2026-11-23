@@ -10,7 +10,7 @@ import { SearchField } from "../components/SearchField";
 import { BusyLabel } from "../components/BusyLabel";
 import {
   filterCoreLogs, LOG_LEVEL_LABELS, logTime, parseCoreLogs,
-  type CoreLogEntry, type LogFilter, type LogLevel,
+  type CoreLogEntry, type LogFilter, type LogLevel, type LogRouteLabels,
 } from "../lib/coreLogs";
 
 const LEVEL_COLORS: Record<LogLevel, string> = {
@@ -67,13 +67,13 @@ function LogRow({ entry, onInspect }: { entry: CoreLogEntry; onInspect: () => vo
   );
 }
 
-export function LogsPanel({ text, loading, fetching, error, paused, onPausedChange, onRefresh }: {
-  text: string; loading: boolean; fetching: boolean; error?: string;
+export function LogsPanel({ text, routes, leaves, labelsSince, loading, fetching, error, paused, onPausedChange, onRefresh }: {
+  text: string; routes?: LogRouteLabels; leaves?: LogRouteLabels; labelsSince?: number | null; loading: boolean; fetching: boolean; error?: string;
   paused: boolean; onPausedChange: (value: boolean) => void; onRefresh: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<LogFilter>("all");
-  const entries = useMemo(() => parseCoreLogs(text), [text]);
+  const entries = useMemo(() => parseCoreLogs(text, routes, labelsSince, leaves), [text, routes, labelsSince, leaves]);
   const visible = useMemo(() => filterCoreLogs(entries, filter, query).reverse(), [entries, filter, query]);
   return (
     <Paper sx={{ overflow: "hidden" }}>
