@@ -29,7 +29,7 @@ import {
 import { desktopApi, useDesktopMutation, useDesktopState } from "../api/desktop";
 import { settingsSaveMessage, useSettingsSave } from "../api/settings";
 import type {
-  Listener,
+  Model,
   Settings as SettingsModel,
 } from "../bindings";
 import { useApplyResult } from "../components/ApplyResultSnackbar";
@@ -42,6 +42,7 @@ import { UpdatePanel } from "../components/UpdatePanel";
 import { UiPreferencesPanel } from "../components/UiPreferencesPanel";
 import { Row, Section } from "../components/SettingsSection";
 import { NodeMonitorSection } from "../components/NodeMonitorSection";
+import { DnsProtectionSection } from "../components/DnsProtectionSection";
 import { PROJECT_LINKS, ProjectLinkRow } from "../components/ProjectLinkRow";
 
 const TABS = [
@@ -67,13 +68,9 @@ function TabPanel({ value, current, children }: { value: TabValue; current: TabV
   );
 }
 
-function SettingsForm({
-  initial,
-  listeners,
-}: {
-  initial: SettingsModel;
-  listeners: Listener[];
-}) {
+function SettingsForm({ model }: { model: Model }) {
+  const initial = model.settings;
+  const listeners = visibleListeners(model);
   const save = useSettingsSave();
   const openLogDir = useOpenLogDir();
   const feedback = useSaveFeedback<"autostart" | "interval" | "url" | "core">();
@@ -180,6 +177,7 @@ function SettingsForm({
         />
       </TabPanel>
       <TabPanel value="network" current={tab}>
+        <DnsProtectionSection model={model} otherSavePending={pending} />
         <Section title="测速">
           {[
             <Row
@@ -407,10 +405,5 @@ function ProcessRoutingSection() {
 export function Settings() {
   const model = useModel();
   if (!model.data) return <Typography>加载中…</Typography>;
-  return (
-    <SettingsForm
-      initial={model.data.settings}
-      listeners={visibleListeners(model.data)}
-    />
-  );
+  return <SettingsForm model={model.data} />;
 }

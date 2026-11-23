@@ -80,6 +80,7 @@ pub struct Applier {
     last_plan: Option<EffectivePlan>,
     /// Last config mihomo accepted (what it currently holds in memory).
     last_yaml: Option<String>,
+    protected_dns_fingerprint: Option<u64>,
 }
 
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
@@ -98,7 +99,18 @@ impl Applier {
             config_path,
             last_plan: None,
             last_yaml: None,
+            protected_dns_fingerprint: None,
         }
+    }
+
+    pub fn has_protected_dns(&self) -> bool {
+        self.protected_dns_fingerprint.is_some()
+    }
+
+    /// Old DNS clients can retain an HTTP connection or dial against the new
+    /// proxy map during hot reload. Change DNS profiles using a fresh core.
+    pub fn requires_dns_restart(&self, next: Option<u64>) -> bool {
+        self.last_yaml.is_some() && self.protected_dns_fingerprint != next
     }
 
     /// Ids of the listeners in the config mihomo currently holds.
@@ -221,7 +233,8 @@ impl Applier {
     /// Loads an empty config so nothing can leak, then cuts every connection
     /// of `old` and `new` (mihomo may have been running either plan, and
     /// existing connections survive reloads, spike S5). Stops the core if
-    /// even the empty config fails.
+    /// even the empty config fails. DNS-protected profiles skip the empty
+    /// reload, because an outstanding resolver could lose its proxy alias.
     async fn fail_closed(
         &mut self,
         error: String,
@@ -229,8 +242,17 @@ impl Applier {
         new: &EffectivePlan,
         controller_port: u16,
         secret: &str,
+        protected_dns: bool,
         stop_core: impl AsyncFnOnce(),
     ) -> ApplyOutcome {
+        if protected_dns {
+            // The pinned core installs the new proxy map before replacing the
+            // resolver. Removing the DNS alias in an empty-config reload can
+            // make an outstanding old DoH lookup dial directly.
+            stop_core().await;
+            self.last_plan = None;
+            return ApplyOutcome::FailedCoreStopped { error };
+        }
         let empty = empty_config(controller_port, secret);
         match self.write_and_reload(&empty).await {
             Ok(()) => {
@@ -270,6 +292,13 @@ impl Applier {
             listeners: BTreeMap::new(),
         });
         let affected = affected_listeners(&old_plan, &generated.plan);
+        let protected_dns = self.protected_dns_fingerprint.is_some() || generated.protected_dns_fingerprint.is_some();
+        if self.requires_dns_restart(generated.protected_dns_fingerprint) {
+            return self.fail_closed(
+                "DNS 分流发生变化，必须重启内核".into(),
+                &old_plan, &generated.plan, controller_port, secret, protected_dns, stop_core,
+            ).await;
+        }
 
         match self.write_and_reload(&generated.yaml).await {
             Ok(()) => {
@@ -279,11 +308,12 @@ impl Applier {
                         // not a valid rollback. Reuse the existing fail-closed path.
                         let error = format!("切换节点失败：策略组「{group}」无法切换到「{member}」：{e}");
                         return self
-                            .fail_closed(error, &old_plan, &generated.plan, controller_port, secret, stop_core)
+                            .fail_closed(error, &old_plan, &generated.plan, controller_port, secret, protected_dns, stop_core)
                             .await;
                     }
                 }
                 self.last_yaml = Some(generated.yaml.clone());
+                self.protected_dns_fingerprint = generated.protected_dns_fingerprint;
                 self.last_plan = Some(generated.plan.clone());
                 // A connection accepted on a port mihomo still holds would
                 // keep the old route: cut only once those ports are gone.
@@ -301,7 +331,7 @@ impl Applier {
                     let list: Vec<String> = still_held.iter().map(u16::to_string).collect();
                     let error = format!("旧端口 {} 未能释放", list.join(", "));
                     return self
-                        .fail_closed(error, &old_plan, &generated.plan, controller_port, secret, stop_core)
+                        .fail_closed(error, &old_plan, &generated.plan, controller_port, secret, protected_dns, stop_core)
                         .await;
                 }
                 let first_cut_at = tokio::time::Instant::now();
@@ -327,11 +357,11 @@ impl Applier {
                     failed_listeners,
                 }
             }
-            Err((rejected, error)) if !rejected || !affected.is_empty() => {
+            Err((rejected, error)) if !rejected || !affected.is_empty() || protected_dns => {
                 // Either a tightening change was rejected (mihomo may keep
                 // routing the old way), or the outcome is ambiguous (timeout,
                 // transport error: mihomo may have applied the new config).
-                self.fail_closed(error, &old_plan, &generated.plan, controller_port, secret, stop_core)
+                self.fail_closed(error, &old_plan, &generated.plan, controller_port, secret, protected_dns, stop_core)
                     .await
             }
             Err((_, error)) => {
@@ -385,6 +415,7 @@ mod tests {
             yaml: yaml.into(),
             plan,
             selects: vec![],
+            protected_dns_fingerprint: None,
         }
     }
 

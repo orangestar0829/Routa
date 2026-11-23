@@ -59,6 +59,28 @@ pub enum SettingsSaveError {
     Operation(String),
 }
 
+/// Require an eligible exit when DNS protection is explicitly enabled or
+/// repointed. Do not block later edits/refreshes when that already-selected
+/// exit disappears: config generation sends those DNS lookups to REJECT.
+fn validate_dns_exit_change(old: &Model, new: &Model) -> Result<(), Vec<ValidationError>> {
+    let previous = &old.settings.dns_protection;
+    let current = &new.settings.dns_protection;
+    if !current.enabled || (previous.enabled && previous.proxy_exit == current.proxy_exit) {
+        return Ok(());
+    }
+    let eligible = current.proxy_exit.as_ref().is_some_and(|id| {
+        new.exits.iter().any(|exit| &exit.id == id && crate::model::dns::eligible_exit(new, exit))
+    });
+    if eligible {
+        Ok(())
+    } else {
+        Err(vec![ValidationError::InvalidProxy {
+            name: "DNS 分流".into(),
+            reason: "请选择受支持的单节点或多跳代理出口".into(),
+        }])
+    }
+}
+
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROLLER_BUSY_PREFIX: &str = "控制端口";
 /// Stands in for the real secret in configs that are only checked (`mihomo -t`).
@@ -107,7 +129,7 @@ pub struct RuntimeStatus {
 pub enum CoreStopReason {
     /// `stop_core`.
     User,
-    /// An apply failed and even the empty config could not be loaded.
+    /// An apply failed; an empty reload was unsafe or also failed.
     FailClosed,
 }
 
@@ -164,8 +186,15 @@ struct Engine {
     /// Whether the supervisor restarts the core when it is not running.
     supervise: bool,
     tun_exit: Option<ExitId>,
+    /// A saved ordinary DNS change has not been loaded, including a disable
+    /// whose attempted replacement core did not start.
+    dns_settings_pending: bool,
     alloc: PortAllocator,
 }
+
+/// The existing process must not hot-reload a distinct DNS policy.
+#[derive(Debug)]
+struct RestartDnsCore;
 
 /// What the samplers need without taking the engine lock.
 #[derive(Default)]
@@ -538,40 +567,57 @@ impl Inner {
         eng: &mut Engine,
         m: Model,
     ) -> Result<ApplyOutcome, Vec<ValidationError>> {
+        validate_dns_exit_change(&eng.model, &m)?;
         self.check_model(eng, &m).await?;
         // A new controller port or binary only takes effect on a fresh core.
         let (old, new) = (&eng.model.settings, &m.settings);
         let restart = eng.supervise && (old.controller_port != new.controller_port || old.core_path != new.core_path);
         self.commit_model(eng, m);
         if restart {
-            return Ok(match self.start_core(eng).await {
-                Ok(()) => self.status.lock().unwrap().last_apply.clone().unwrap_or_else(core_not_running),
-                Err(error) => ApplyOutcome::NotRunning { error },
-            });
+            return Ok(self.restart_and_outcome(eng).await);
         }
         Ok(self.apply(eng).await)
     }
 
     /// The config `m` would generate must pass `mihomo -t`, or mihomo rejects
     /// the whole config on every later apply. A check that cannot run (e.g.
-    /// the core binary is missing) is skipped: nothing would start anyway.
+    /// the core binary is missing) is skipped for legacy profiles; DNS
+    /// protection must pass a real check before it can be saved.
     async fn check_model(&self, eng: &mut Engine, m: &Model) -> Result<(), Vec<ValidationError>> {
         let nics = self.nics.list();
         let health = evaluate(m, &nics);
         let fetch = fetch_listener_ports(m, &mut eng.alloc);
-        let generated = generate_for_capture(
-            &GenInput {
-                model: m,
-                health: &health,
-                secret: CHECK_SECRET,
-                fetch_listeners: &fetch,
-                nics: &nics,
-            },
-            eng.tun_exit.as_ref(),
-        );
-        match self.check_yaml(&m.settings, &generated.yaml).await {
+        let input = GenInput {
+            model: m,
+            health: &health,
+            secret: CHECK_SECRET,
+            fetch_listeners: &fetch,
+            nics: &nics,
+        };
+        // While TUN is active the DNS diversion settings are suspended.
+        // Check the ordinary profile as well before persisting it.
+        if eng.tun_exit.is_some() && m.settings.dns_protection.enabled {
+            let ordinary = generate_for_capture(&input, None);
+            self.check_generated(&m.settings, &ordinary).await?;
+        }
+        let generated = generate_for_capture(&input, eng.tun_exit.as_ref());
+        self.check_generated(&m.settings, &generated).await
+    }
+
+    async fn check_generated(
+        &self,
+        settings: &Settings,
+        generated: &crate::config_gen::Generated,
+    ) -> Result<(), Vec<ValidationError>> {
+        match self.check_yaml(settings, &generated.yaml).await {
             Ok(()) => Ok(()),
             Err(CheckError::Rejected(message)) => Err(vec![ValidationError::CoreRejected { message }]),
+            Err(CheckError::Unavailable(_)) if generated.protected_dns_fingerprint.is_some() => {
+                Err(vec![ValidationError::InvalidProxy {
+                    name: "DNS 分流".into(),
+                    reason: "暂时无法校验 DNS 分流，请检查内核后重试".into(),
+                }])
+            }
             Err(CheckError::Unavailable(e)) => {
                 eprintln!("runtime: config check skipped: {e}");
                 Ok(())
@@ -597,11 +643,17 @@ impl Inner {
 
     /// Stops and forgets the current core instance (no-op without one).
     async fn drop_core(&self, eng: &mut Engine) {
+        self.drop_core_inner(eng, false).await;
+    }
+
+    async fn drop_core_inner(&self, eng: &mut Engine, confirmed_stopped: bool) {
         if let Some(mut run) = eng.core.take() {
             run.traffic_stream.abort();
             run.log_stream.abort();
-            if let Err(e) = run.handle.stop().await {
-                eprintln!("runtime: stopping mihomo failed: {e}");
+            if !confirmed_stopped {
+                if let Err(e) = run.handle.stop().await {
+                    eprintln!("runtime: stopping mihomo failed: {e}");
+                }
             }
         }
         {
@@ -715,7 +767,26 @@ impl Inner {
         if self.is_shut_down() {
             return Err(SHUT_DOWN.into());
         }
-        self.drop_core(eng).await;
+        // When either the current or the requested config protects DNS,
+        // do not replace the process until Windows confirms the old one is
+        // gone. On failure keep its handle/plan for diagnostics and retry.
+        let protected = eng.model.settings.dns_protection.enabled
+            || eng.core.as_ref().is_some_and(|run| run.applier.has_protected_dns());
+        let mut confirmed_stopped = false;
+        if protected {
+            if let Some(run) = eng.core.as_mut() {
+                if let Err(e) = run.handle.stop().await {
+                    let error = format!("未能停止旧内核，DNS 分流变更未生效：{e}");
+                    eprintln!("runtime: {error}");
+                    self.status.lock().unwrap().last_apply =
+                        Some(ApplyOutcome::FailedKeptPrevious { error: error.clone() });
+                    self.emit_status();
+                    return Err(error);
+                }
+                confirmed_stopped = true;
+            }
+        }
+        self.drop_core_inner(eng, confirmed_stopped).await;
         self.set_core_state(CoreState::Starting);
         let res = self.launch_core(eng).await;
         match &res {
@@ -733,7 +804,8 @@ impl Inner {
                     }
                 }
                 // A fresh core has no connections, so `uncut` here is moot.
-                self.apply_once(eng).await;
+                let applied = self.apply_once(eng).await;
+                debug_assert!(applied.is_ok(), "a fresh core cannot need a DNS restart");
             }
             Err(e) => {
                 eprintln!("runtime: {e}");
@@ -741,6 +813,14 @@ impl Inner {
             }
         }
         res
+    }
+
+    async fn restart_and_outcome(self: &Arc<Self>, eng: &mut Engine) -> ApplyOutcome {
+        match self.start_core(eng).await {
+            Ok(()) => self.status.lock().unwrap().last_apply.clone().unwrap_or_else(core_not_running),
+            Err(error) if eng.core.is_some() => ApplyOutcome::FailedKeptPrevious { error },
+            Err(error) => ApplyOutcome::NotRunning { error },
+        }
     }
 
     async fn launch_core(self: &Arc<Self>, eng: &mut Engine) -> Result<(), String> {
@@ -802,13 +882,14 @@ impl Inner {
     /// evaluate → generate → apply (when a core runs) → update status → emit.
     /// `None` when no core is running (health and interfaces still update).
     /// After a successful reload the Tailscale instances are prewarmed.
-    async fn apply_once(self: &Arc<Self>, eng: &mut Engine) -> Option<ApplyOutcome> {
+    async fn apply_once(self: &Arc<Self>, eng: &mut Engine) -> Result<Option<ApplyOutcome>, RestartDnsCore> {
         let nics = self.nics.list();
         let Engine {
             model,
             core,
             alloc,
             tun_exit,
+            dns_settings_pending,
             ..
         } = eng;
         let health = evaluate(model, &nics);
@@ -827,6 +908,9 @@ impl Inner {
                     },
                     tun_exit.as_ref(),
                 );
+                if run.applier.requires_dns_restart(generated.protected_dns_fingerprint) {
+                    return Err(RestartDnsCore);
+                }
                 let plan = generated.plan.clone();
                 let CoreRun {
                     handle,
@@ -873,6 +957,9 @@ impl Inner {
             None => None,
         };
 
+        if tun_exit.is_none() && matches!(&outcome, Some(ApplyOutcome::Reloaded { .. })) {
+            *dns_settings_pending = false;
+        }
         if let Some(ApplyOutcome::FailedCoreStopped { .. }) = &outcome {
             // The applier already stopped it; the supervisor restarts it
             // (empty config first) with backoff.
@@ -904,7 +991,7 @@ impl Inner {
         if matches!(outcome, Some(ApplyOutcome::Reloaded { .. })) {
             self.prewarm_tailscales(tailscales);
         }
-        outcome
+        Ok(outcome)
     }
 
     /// mihomo recreates each Tailscale instance lazily on its first dial
@@ -930,7 +1017,7 @@ impl Inner {
     async fn apply(self: &Arc<Self>, eng: &mut Engine) -> ApplyOutcome {
         self.reset_exit_node_retries();
         match self.apply_once(eng).await {
-            Some(out) => {
+            Ok(Some(out)) => {
                 if uncut(&out) > 0 {
                     eprintln!(
                         "runtime: {} connection(s) could not be cut; restarting mihomo",
@@ -940,7 +1027,8 @@ impl Inner {
                 }
                 out
             }
-            None => core_not_running(),
+            Ok(None) => core_not_running(),
+            Err(RestartDnsCore) => self.restart_and_outcome(eng).await,
         }
     }
 
@@ -1196,6 +1284,7 @@ impl Runtime {
                 core: None,
                 supervise: false,
                 tun_exit: None,
+                dns_settings_pending: false,
                 alloc: PortAllocator::new(),
             }),
             model: Mutex::new(model),
@@ -1253,8 +1342,8 @@ impl Runtime {
         self.inner.set_core_state(CoreState::Stopped);
     }
 
-    /// Settings preferences do not belong to the core config. Persist them
-    /// without a reload; only changed core parameters take the apply path.
+    /// Persist UI-only preferences without a reload. Core parameters and
+    /// changes to the enabled DNS diversion policy take the apply path.
     /// Keep OS autostart and persistence failures observable to the caller.
     pub async fn save_settings(
         &self,
@@ -1268,13 +1357,24 @@ impl Runtime {
         settings.core_path = None;
         let old_autostart = eng.model.settings.autostart;
         let autostart_changed = settings.autostart != old_autostart;
-        let core_changed = settings.controller_port != eng.model.settings.controller_port
-            || settings.core_path != eng.model.settings.core_path;
+        let old_settings = &eng.model.settings;
+        let core_changed = settings.controller_port != old_settings.controller_port
+            || settings.core_path != old_settings.core_path;
+        let dns_was_protected = old_settings.dns_protection.enabled
+            || eng.core.as_ref().is_some_and(|run| run.applier.has_protected_dns());
+        let dns_changed = settings.dns_protection != old_settings.dns_protection
+            && (settings.dns_protection.enabled || old_settings.dns_protection.enabled);
+        let dns_retry = eng.dns_settings_pending || ((settings.dns_protection.enabled || dns_was_protected)
+            && matches!(&self.inner.status.lock().unwrap().last_apply,
+                Some(ApplyOutcome::FailedKeptPrevious { .. } | ApplyOutcome::FailedClosed { .. }
+                    | ApplyOutcome::FailedCoreStopped { .. } | ApplyOutcome::NotRunning { .. })));
+        let apply_dns = eng.tun_exit.is_none() && (dns_changed || dns_retry);
         let mut model = eng.model.clone();
         model.settings = settings;
         normalize(&mut model);
         validate(&model).map_err(SettingsSaveError::Validation)?;
-        if core_changed {
+        validate_dns_exit_change(&eng.model, &model).map_err(SettingsSaveError::Validation)?;
+        if core_changed || dns_changed || apply_dns {
             self.inner.check_model(&mut eng, &model).await.map_err(SettingsSaveError::Validation)?;
         }
         if autostart_changed {
@@ -1297,16 +1397,14 @@ impl Runtime {
         }
         *self.inner.model.lock().unwrap() = model.clone();
         eng.model = model;
+        eng.dns_settings_pending |= apply_dns;
         self.inner.sync_delay_contexts(&eng.model);
-        if !core_changed {
+        if !core_changed && !apply_dns {
             self.inner.emit_status();
             return Ok(ApplyOutcome::Reloaded { cut: 0, uncut: 0, failed_listeners: vec![] });
         }
-        if eng.supervise {
-            return Ok(match self.inner.start_core(&mut eng).await {
-                Ok(()) => self.inner.status.lock().unwrap().last_apply.clone().unwrap_or_else(core_not_running),
-                Err(error) => ApplyOutcome::NotRunning { error },
-            });
+        if (core_changed || (apply_dns && eng.core.is_none())) && eng.supervise {
+            return Ok(self.inner.restart_and_outcome(&mut eng).await);
         }
         Ok(self.inner.apply(&mut eng).await)
     }
@@ -1448,7 +1546,13 @@ impl Runtime {
         let outcome = self.inner.apply(&mut eng).await;
         if !matches!(&outcome, ApplyOutcome::Reloaded { failed_listeners, .. } if failed_listeners.is_empty()) {
             eng.tun_exit = old;
-            let _ = self.inner.apply(&mut eng).await;
+            // A protected DNS transition can stop the old core. Restore the
+            // previous profile on a fresh core if the new launch/apply failed.
+            if eng.core.is_none() && eng.supervise && eng.model.settings.dns_protection.enabled {
+                let _ = self.inner.start_core(&mut eng).await;
+            } else {
+                let _ = self.inner.apply(&mut eng).await;
+            }
             return Err(format!("TUN 设置未能生效：{outcome:?}"));
         }
         Ok(())

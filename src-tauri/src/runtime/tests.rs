@@ -59,11 +59,15 @@ type ExitCell = Arc<Mutex<Option<Option<i32>>>>;
 struct FakeHandle {
     exit: ExitCell,
     stopped: Arc<AtomicBool>,
+    stop_fails: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl CoreHandleLike for FakeHandle {
     async fn stop(&mut self) -> io::Result<()> {
+        if self.stop_fails.load(Ordering::SeqCst) {
+            return Err(io::Error::other("fake kill error"));
+        }
         self.stopped.store(true, Ordering::SeqCst);
         let mut e = self.exit.lock().unwrap();
         if e.is_none() {
@@ -85,6 +89,7 @@ struct FakeLauncher {
     launches: Mutex<Vec<String>>,
     exits: Mutex<Vec<ExitCell>>,
     stopped: Mutex<Vec<Arc<AtomicBool>>>,
+    stop_fails: Arc<AtomicBool>,
     /// `check_config` results consumed in call order; once exhausted every check is Ok.
     check_results: Mutex<VecDeque<Result<(), CheckError>>>,
     /// Config file content at the moment of each check.
@@ -115,7 +120,7 @@ impl CoreLauncher for FakeLauncher {
         let stopped = Arc::new(AtomicBool::new(false));
         self.exits.lock().unwrap().push(exit.clone());
         self.stopped.lock().unwrap().push(stopped.clone());
-        Ok(Box::new(FakeHandle { exit, stopped }))
+        Ok(Box::new(FakeHandle { exit, stopped, stop_fails: self.stop_fails.clone() }))
     }
     async fn check_config(&self, config: &Path) -> Result<(), CheckError> {
         let content = std::fs::read_to_string(config).unwrap_or_default();
@@ -1188,6 +1193,230 @@ async fn settings_preferences_save_without_check_reload_or_restart() {
     assert_eq!(h.launcher.count(), 1);
     assert_eq!(h.launcher.checks.lock().unwrap().len(), checks);
     assert_eq!(h.api.reloads.lock().unwrap().len(), reloads);
+    h.rt.shutdown().await;
+}
+
+fn model_with_dns_exit(bind_nic: bool) -> Model {
+    let mut m = model_with_listener(false);
+    let node_id = ManualNodeId("dns-node".into());
+    m.manual_nodes.push(ManualNode {
+        id: node_id.clone(),
+        name: "DNS HTTP".into(),
+        groups: vec![],
+        kind: ManualNodeKind::Proxy { raw: serde_json::json!({
+            "name": "DNS HTTP", "type": "http", "server": "127.0.0.1", "port": 8123,
+        }) },
+    });
+    let id = ExitId("dns-exit".into());
+    m.exits.push(Exit {
+        id: id.clone(),
+        name: "DNS 出口".into(),
+        kind: ExitKind::Node { node: NodeRef::Manual { manual_id: node_id } },
+        interface: bind_nic.then(|| InterfaceGuid(NIC_GUID.into())),
+        hidden: false,
+    });
+    m.settings.dns_protection.proxy_exit = Some(id);
+    m
+}
+
+fn dns_alias_target(yaml: &str) -> Option<String> {
+    let config: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+    config["proxy-groups"].as_sequence().unwrap().iter()
+        .find(|g| g["name"].as_str() == Some("__routa_dns__"))
+        .and_then(|g| g["proxies"][0].as_str())
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn dns_save_validates_new_selection_and_restarts_only_active_policy() {
+    let m = model_with_dns_exit(false);
+    let h = harness(&m);
+    h.rt.restart_core().await;
+    let mut settings = m.settings.clone();
+    // Adjusting pending values while off must not check or replace live YAML.
+    settings.dns_protection.direct_dns = "1.2.3.4".into();
+    h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    assert_eq!(h.launcher.count(), 1);
+    assert!(h.launcher.checks.lock().unwrap().is_empty());
+    assert!(dns_alias_target(&last_reload(&h.api)).is_none());
+
+    settings.dns_protection.enabled = true;
+    settings.dns_protection.proxy_exit = Some(m.exits[0].id.clone()); // Direct is never eligible.
+    let error = h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap_err();
+    assert!(matches!(error, SettingsSaveError::Validation(_)));
+    assert_eq!(h.launcher.count(), 1);
+    assert!(!h.rt.model().settings.dns_protection.enabled);
+
+    settings.dns_protection.proxy_exit = Some(m.exits[1].id.clone());
+    assert!(matches!(h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap(), ApplyOutcome::Reloaded { .. }));
+    assert_eq!(h.launcher.count(), 2);
+    assert!(h.launcher.stopped(0));
+    let protected = last_reload(&h.api);
+    assert_eq!(dns_alias_target(&protected).as_deref(), Some("DNS 出口"));
+    assert_eq!(listener_names(&protected), vec!["L1".to_string()]);
+
+    let mut next = settings;
+    next.dns_protection.enabled = false;
+    assert!(matches!(h.rt.save_settings(next, |_| Ok(())).await.unwrap(), ApplyOutcome::Reloaded { .. }));
+    assert_eq!(h.launcher.count(), 3);
+    assert!(h.launcher.stopped(1));
+    assert!(dns_alias_target(&last_reload(&h.api)).is_none());
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn dns_enable_does_not_save_when_core_validation_is_unavailable() {
+    let m = model_with_dns_exit(false);
+    let h = harness(&m);
+    h.rt.restart_core().await;
+    let mut settings = m.settings.clone();
+    settings.dns_protection.enabled = true;
+    h.launcher.push_check(Err(CheckError::Unavailable("fake unavailable".into())));
+    let error = h.rt.save_settings(settings, |_| Ok(())).await.unwrap_err();
+    assert!(matches!(error, SettingsSaveError::Validation(ref errors)
+        if matches!(errors.as_slice(), [ValidationError::InvalidProxy { name, .. }] if name == "DNS 分流")));
+    assert!(!h.rt.model().settings.dns_protection.enabled);
+    assert_eq!(h.launcher.count(), 1);
+    assert!(dns_alias_target(&last_reload(&h.api)).is_none());
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn dns_restart_refuses_to_reload_or_replace_a_core_that_will_not_stop() {
+    let m = model_with_dns_exit(false);
+    let h = harness(&m);
+    h.rt.restart_core().await;
+    h.launcher.stop_fails.store(true, Ordering::SeqCst);
+    let reloads = h.api.reloads.lock().unwrap().len();
+    let mut settings = m.settings.clone();
+    settings.dns_protection.enabled = true;
+    let outcome = h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    assert!(matches!(outcome, ApplyOutcome::FailedKeptPrevious { .. }));
+    assert_eq!(h.rt.status().last_apply, Some(outcome));
+    assert_eq!(h.rt.status().core, CoreState::Running);
+    assert_eq!(h.launcher.count(), 1);
+    assert!(!h.launcher.stopped(0));
+    assert_eq!(h.api.reloads.lock().unwrap().len(), reloads);
+    assert!(dns_alias_target(&last_reload(&h.api)).is_none());
+
+    h.launcher.stop_fails.store(false, Ordering::SeqCst);
+    let retry = h.rt.save_settings(settings, |_| Ok(())).await.unwrap();
+    assert!(matches!(retry, ApplyOutcome::Reloaded { .. }));
+    assert!(h.launcher.stopped(0));
+    assert_eq!(dns_alias_target(&last_reload(&h.api)).as_deref(), Some("DNS 出口"));
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn dns_disable_retry_restarts_after_the_previous_apply_stopped_the_core() {
+    let mut m = model_with_dns_exit(false);
+    m.settings.dns_protection.enabled = true;
+    let h = harness(&m);
+    h.rt.restart_core().await;
+    let mut settings = m.settings.clone();
+    settings.dns_protection.enabled = false;
+    // In the fresh unprotected process, the first reload is ambiguous and
+    // loading the empty config also fails, so no live process remains.
+    for _ in 0..2 {
+        h.api.reload_results.lock().unwrap().push_back(Err(
+            crate::core::api::ApiError::Unreachable("fake timeout".into()),
+        ));
+    }
+    let failed = h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    assert!(matches!(failed, ApplyOutcome::FailedCoreStopped { .. }));
+    assert!(h.launcher.stopped(0));
+    assert!(h.launcher.stopped(1));
+
+    let retry = h.rt.save_settings(settings.clone(), |_| Ok(())).await.unwrap();
+    assert!(matches!(retry, ApplyOutcome::Reloaded { .. }));
+    assert_eq!(h.launcher.count(), 3);
+    assert!(dns_alias_target(&last_reload(&h.api)).is_none());
+    // Once applied, this is a preference save again.
+    let reloads = h.api.reloads.lock().unwrap().len();
+    h.rt.save_settings(settings, |_| Ok(())).await.unwrap();
+    assert_eq!(h.launcher.count(), 3);
+    assert_eq!(h.api.reloads.lock().unwrap().len(), reloads);
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn dns_restarts_on_egress_loss_but_not_unrelated_edits() {
+    let mut m = model_with_dns_exit(true);
+    m.settings.dns_protection.enabled = true;
+    let h = harness(&m);
+    h.rt.restart_core().await;
+    assert_eq!(dns_alias_target(&last_reload(&h.api)).as_deref(), Some("DNS 出口"));
+
+    h.rt.mutate(|m| m.listeners[0].auth = Some(Auth {
+        username: "new".into(), password: "secret".into(),
+    })).await.unwrap();
+    assert_eq!(h.launcher.count(), 1);
+
+    // Disabling the bound NIC must not reuse a DoH connection from the old
+    // process or resolve through the system interface.
+    h.nics.0.lock().unwrap().clear();
+    assert!(h.rt.refresh_interfaces().await);
+    assert_eq!(h.launcher.count(), 2);
+    assert!(h.launcher.stopped(0));
+    assert_eq!(dns_alias_target(&last_reload(&h.api)).as_deref(), Some("REJECT"));
+
+    h.nics.0.lock().unwrap().push(nic());
+    assert!(h.rt.refresh_interfaces().await);
+    assert_eq!(h.launcher.count(), 3);
+    assert!(h.launcher.stopped(1));
+    assert_eq!(dns_alias_target(&last_reload(&h.api)).as_deref(), Some("DNS 出口"));
+
+    let out = h.rt.mutate(|m| m.exits.retain(|e| e.id.0 != "dns-exit")).await.unwrap();
+    assert!(matches!(out, ApplyOutcome::Reloaded { .. }));
+    assert_eq!(h.launcher.count(), 4);
+    assert_eq!(dns_alias_target(&last_reload(&h.api)).as_deref(), Some("REJECT"));
+    assert_eq!(h.rt.model().settings.dns_protection.proxy_exit, Some(ExitId("dns-exit".into())));
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn protected_apply_failure_stops_core_without_reloading_empty_config() {
+    let mut m = model_with_dns_exit(false);
+    m.settings.dns_protection.enabled = true;
+    let h = harness(&m);
+    h.rt.restart_core().await;
+    let before = h.api.reloads.lock().unwrap().len();
+    reject_next_reload(&h.api);
+    let out = h.rt.mutate(|m| m.settings.autostart = true).await.unwrap();
+    assert!(matches!(out, ApplyOutcome::FailedCoreStopped { .. }));
+    assert_eq!(h.api.reloads.lock().unwrap().len(), before + 1); // No unprotected fallback PUT.
+    assert!(h.launcher.stopped(0));
+    assert!(h.rt.status().effective_listeners.is_empty());
+    assert_eq!(h.rt.status().core_stop_reason, Some(CoreStopReason::FailClosed));
+    h.rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn tun_suspends_dns_diversion_using_a_separate_core_and_restores_it() {
+    let mut m = model_with_dns_exit(false);
+    m.settings.dns_protection.enabled = true;
+    let h = harness(&m);
+    h.rt.restart_core().await;
+    let capture_exit = m.exits[0].id.clone();
+    h.rt.set_tun_exit(Some(capture_exit)).await.unwrap();
+    assert_eq!(h.launcher.count(), 2);
+    assert!(h.launcher.stopped(0));
+    let tun = last_reload(&h.api);
+    assert!(dns_alias_target(&tun).is_none());
+    let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(&tun).unwrap();
+    assert_eq!(cfg["dns"]["enhanced-mode"].as_str(), Some("fake-ip"));
+
+    let mut settings = h.rt.model().settings;
+    settings.dns_protection.direct_dns = "1.2.3.4".into();
+    h.rt.save_settings(settings, |_| Ok(())).await.unwrap();
+    assert_eq!(h.launcher.count(), 2);
+    assert_eq!(last_reload(&h.api), tun);
+    assert_eq!(h.launcher.checks.lock().unwrap().len(), 2);
+
+    h.rt.set_tun_exit(None).await.unwrap();
+    assert_eq!(h.launcher.count(), 3);
+    assert!(h.launcher.stopped(1));
+    assert_eq!(dns_alias_target(&last_reload(&h.api)).as_deref(), Some("DNS 出口"));
     h.rt.shutdown().await;
 }
 
